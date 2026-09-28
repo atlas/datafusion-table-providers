@@ -5,10 +5,9 @@ use std::sync::Arc;
 use arrow::array::{
     new_null_array, Array, ArrayBuilder, ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder,
     Decimal128Builder, FixedSizeListBuilder, Float32Builder, Float64Builder, Int16Builder,
-    Int32Builder, Int64Builder, Int8Builder, IntervalMonthDayNanoBuilder, LargeBinaryBuilder,
-    LargeStringBuilder, ListBuilder, RecordBatch, RecordBatchOptions, StringArray, StringBuilder,
-    StringDictionaryBuilder, StructBuilder, Time64NanosecondBuilder, TimestampNanosecondBuilder,
-    UInt32Builder,
+    Int32Builder, Int64Builder, Int8Builder, IntervalMonthDayNanoBuilder, ListBuilder, RecordBatch,
+    RecordBatchOptions, StringArray, StringBuilder, StringDictionaryBuilder,
+    Time64NanosecondBuilder, TimestampNanosecondBuilder, UInt32Builder,
 };
 use arrow::datatypes::{
     DataType, Date32Type, Field, Int8Type, IntervalMonthDayNanoType, IntervalUnit, Schema,
@@ -18,9 +17,9 @@ use arrow_json::ReaderBuilder;
 use bigdecimal::BigDecimal;
 use byteorder::{BigEndian, ReadBytesExt};
 use chrono::{DateTime, Timelike, Utc};
-use composite::CompositeType;
 use datafusion_table_providers_common::sql::arrow_sql_gen::arrow::map_data_type_to_array_builder_optional;
 use datafusion_table_providers_common::sql::arrow_sql_gen::statement::map_data_type_to_column_type;
+use domain::Transparent;
 use geo_types::geometry::Point;
 use rust_decimal::Decimal;
 use sea_query::{Alias, ColumnType, SeaRc};
@@ -32,7 +31,9 @@ use tokio_postgres::{types::Type, Row};
 
 pub mod builder;
 pub mod composite;
+mod domain;
 pub mod hive_schema;
+pub(crate) mod nested;
 pub mod schema;
 pub mod statement_ext;
 
@@ -119,6 +120,13 @@ pub enum Error {
         scale: u32,
     },
 
+    #[snafu(display("Failed to decode a {pg_type} value in '{field_name}': {source}"))]
+    FailedToDecodeNestedValue {
+        pg_type: Type,
+        field_name: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("The field '{field_name}' has an unsupported data type: {data_type}."))]
     UnsupportedDataType {
         data_type: String,
@@ -184,9 +192,8 @@ macro_rules! handle_primitive_type {
             }
             .fail();
         };
-        let v: Option<$value_ty> = $row
-            .try_get($index)
-            .context(FailedToGetRowValueSnafu { pg_type: $type })?;
+        let v: Option<$value_ty> =
+            get($row, $index).context(FailedToGetRowValueSnafu { pg_type: $type })?;
 
         match v {
             Some(v) => builder.append_value(v),
@@ -206,12 +213,11 @@ macro_rules! handle_primitive_array_type {
             }
             .fail();
         };
-        let v: Option<Vec<$value_type>> = $row
-            .try_get($i)
-            .context(FailedToGetRowValueSnafu { pg_type: $type })?;
+        let v: Option<Vec<Transparent<$value_type>>> =
+            get($row, $i).context(FailedToGetRowValueSnafu { pg_type: $type })?;
         match v {
             Some(v) => {
-                let v = v.into_iter().map(Some);
+                let v = v.into_iter().map(|v| Some(v.0));
                 builder.append_value(v);
             }
             None => builder.append_null(),
@@ -219,87 +225,12 @@ macro_rules! handle_primitive_array_type {
     }};
 }
 
-macro_rules! handle_composite_type {
-    ($BuilderType:ty, $ValueType:ty, $pg_type:expr, $composite_type:expr, $builder:expr, $idx:expr, $field_name:expr) => {{
-        let Some(field_builder) = $builder.field_builder::<$BuilderType>($idx) else {
-            return FailedToDowncastBuilderSnafu {
-                postgres_type: format!("{}", $pg_type),
-            }
-            .fail();
-        };
-        let v: Option<$ValueType> =
-            $composite_type
-                .try_get($field_name)
-                .context(FailedToGetCompositeRowValueSnafu {
-                    pg_type: $pg_type.clone(),
-                })?;
-        match v {
-            Some(v) => field_builder.append_value(v),
-            None => field_builder.append_null(),
-        }
-    }};
-}
-
-macro_rules! handle_composite_types {
-    ($field_type:expr, $pg_type:expr, $composite_type:expr, $builder:expr, $idx:expr, $field_name:expr, $($DataType:ident => ($BuilderType:ty, $ValueType:ty)),*) => {
-        match $field_type {
-            $(
-                DataType::$DataType => {
-                    handle_composite_type!(
-                        $BuilderType,
-                        $ValueType,
-                        $pg_type,
-                        $composite_type,
-                        $builder,
-                        $idx,
-                        $field_name
-                    );
-                }
-            )*
-            _ => unimplemented!("Unsupported field type {:?}", $field_type),
-        }
-    }
-}
-
-/// Appends every field of a `CompositeType` value into `$struct_builder`'s field builders
-/// (a single struct row). The caller is responsible for the matching
-/// `$struct_builder.append(...)` validity call. Shared by the top-level composite column
-/// path and the composite-array (`List<Struct>`) element path.
-macro_rules! append_composite_fields_to_struct {
-    ($composite_type:expr, $struct_builder:expr) => {{
-        let fields = $composite_type.fields();
-        for (idx, field) in fields.iter().enumerate() {
-            let field_name = field.name();
-            let Some(field_type) = map_column_type_to_data_type(field.type_(), field_name)? else {
-                return UnsupportedDataTypeSnafu {
-                    data_type: field.type_().to_string(),
-                    field_name: field_name.to_string(),
-                }
-                .fail();
-            };
-
-            handle_composite_types!(
-                field_type,
-                field.type_(),
-                $composite_type,
-                $struct_builder,
-                idx,
-                field_name,
-                Boolean => (BooleanBuilder, bool),
-                Int8 => (Int8Builder, i8),
-                Int16 => (Int16Builder, i16),
-                Int32 => (Int32Builder, i32),
-                Int64 => (Int64Builder, i64),
-                UInt32 => (UInt32Builder, u32),
-                Float32 => (Float32Builder, f32),
-                Float64 => (Float64Builder, f64),
-                Binary => (BinaryBuilder, Vec<u8>),
-                LargeBinary => (LargeBinaryBuilder, Vec<u8>),
-                Utf8 => (StringBuilder, String),
-                LargeUtf8 => (LargeStringBuilder, String)
-            );
-        }
-    }};
+/// Reads column `i` of `row`, a domain as the type it is over.
+fn get<'a, T: FromSql<'a>>(
+    row: &'a Row,
+    i: usize,
+) -> std::result::Result<T, tokio_postgres::Error> {
+    row.try_get::<usize, Transparent<T>>(i).map(|v| v.0)
 }
 
 /// Converts Postgres `Row`s to an Arrow `RecordBatch`. Assumes that all rows have the same schema and
@@ -321,7 +252,8 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
         let row = &rows[0];
         for column in row.columns() {
             let column_name = column.name();
-            let column_type = column.type_();
+            // A domain is read as the type it is over; see `domain`.
+            let column_type = &domain::normalized(column.type_());
             let projected_json_complex_field =
                 projected_json_complex_field(projected_schema, column_name, column_type);
 
@@ -355,6 +287,16 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                 } else {
                     None
                 }
+            } else if nested::decodes(column_type) {
+                // The schema's type where there is one: it carries the precision and scale
+                // of any `numeric` inside, which the column's `Type` does not.
+                match projected_schema
+                    .as_ref()
+                    .and_then(|schema| schema.field_with_name(column_name).ok())
+                {
+                    Some(field) => Some(field.data_type().clone()),
+                    None => map_column_type_to_data_type(column_type, column_name)?,
+                }
             } else {
                 map_column_type_to_data_type(column_type, column_name)?
             };
@@ -380,8 +322,15 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                 None => arrow_fields.push(None),
             }
             postgres_numeric_scales.push(numeric_scale);
-            arrow_columns_builders
-                .push(map_data_type_to_array_builder_optional(data_type.as_ref()));
+            // Composites and arrays are decoded recursively, into builders of Arrow's own
+            // making; see `nested`.
+            arrow_columns_builders.push(if nested::decodes(column_type) {
+                data_type
+                    .as_ref()
+                    .map(|data_type| nested::make_builder(data_type, rows.len()))
+            } else {
+                map_data_type_to_array_builder_optional(data_type.as_ref())
+            });
             postgres_types.push(column_type.clone());
             column_names.push(column_name.to_string());
             projected_json_complex_fields.push(projected_json_complex_field);
@@ -401,6 +350,29 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
             let Some(postgres_numeric_scale) = postgres_numeric_scales.get_mut(i) else {
                 return NoPostgresScaleForIndexSnafu { index: i }.fail();
             };
+
+            if nested::decodes(postgres_type) {
+                let Some(builder) = builder else {
+                    return NoBuilderForIndexSnafu { index: i }.fail();
+                };
+                let Some(column_name) = column_names.get(i) else {
+                    return NoColumnNameForIndexSnafu { index: i }.fail();
+                };
+                let Some(field) = arrow_field.as_ref() else {
+                    return NoArrowFieldForIndexSnafu { index: i }.fail();
+                };
+                let raw = nested::read(row, i).context(FailedToGetRowValueSnafu {
+                    pg_type: postgres_type.clone(),
+                })?;
+                nested::append(
+                    builder.as_mut(),
+                    postgres_type,
+                    field.data_type(),
+                    raw,
+                    column_name,
+                )?;
+                continue;
+            }
 
             match *postgres_type {
                 Type::INT2 => {
@@ -425,8 +397,7 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                         }
                         .fail();
                     };
-                    let v = row
-                        .try_get::<usize, Option<XidFromSql>>(i)
+                    let v = get::<Option<XidFromSql>>(row, i)
                         .with_context(|_| FailedToGetRowValueSnafu { pg_type: Type::XID })?;
 
                     match v {
@@ -467,7 +438,7 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                         }
                         .fail();
                     };
-                    let v: Option<&str> = row.try_get(i).context(FailedToGetRowValueSnafu {
+                    let v: Option<&str> = get(row, i).context(FailedToGetRowValueSnafu {
                         pg_type: Type::BPCHAR,
                     })?;
 
@@ -489,11 +460,11 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                         }
                         .fail();
                     };
-                    let v = row
-                        .try_get::<usize, Option<MoneyFromSql>>(i)
-                        .with_context(|_| FailedToGetRowValueSnafu {
+                    let v = get::<Option<MoneyFromSql>>(row, i).with_context(|_| {
+                        FailedToGetRowValueSnafu {
                             pg_type: Type::MONEY,
-                        })?;
+                        }
+                    })?;
 
                     match v {
                         Some(v) => {
@@ -513,11 +484,11 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                         }
                         .fail();
                     };
-                    let v = row
-                        .try_get::<usize, Option<JsonbRawString>>(i)
-                        .with_context(|_| FailedToGetRowValueSnafu {
+                    let v = get::<Option<JsonbRawString>>(row, i).with_context(|_| {
+                        FailedToGetRowValueSnafu {
                             pg_type: postgres_type.clone(),
-                        })?;
+                        }
+                    })?;
 
                     match v {
                         Some(v) => builder.append_value(v.0),
@@ -537,11 +508,11 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                         }
                         .fail();
                     };
-                    let v = row
-                        .try_get::<usize, Option<chrono::NaiveTime>>(i)
-                        .with_context(|_| FailedToGetRowValueSnafu {
+                    let v = get::<Option<chrono::NaiveTime>>(row, i).with_context(|_| {
+                        FailedToGetRowValueSnafu {
                             pg_type: Type::TIME,
-                        })?;
+                        }
+                    })?;
 
                     match v {
                         Some(v) => {
@@ -567,7 +538,7 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                         .fail();
                     };
 
-                    let v = row.try_get::<usize, Option<Point>>(i).with_context(|_| {
+                    let v = get::<Option<Point>>(row, i).with_context(|_| {
                         FailedToGetRowValueSnafu {
                             pg_type: Type::POINT,
                         }
@@ -598,7 +569,7 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                     };
 
                     let v: Option<IntervalFromSql> =
-                        row.try_get(i).context(FailedToGetRowValueSnafu {
+                        get(row, i).context(FailedToGetRowValueSnafu {
                             pg_type: Type::INTERVAL,
                         })?;
                     match v {
@@ -618,7 +589,7 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                         return NoColumnNameForIndexSnafu { index: i }.fail();
                     };
                     let column_name = column_name.clone();
-                    let v: Option<Decimal> = row.try_get(i).context(FailedToGetRowValueSnafu {
+                    let v: Option<Decimal> = get(row, i).context(FailedToGetRowValueSnafu {
                         pg_type: Type::NUMERIC,
                     })?;
                     // A declared scale (`numeric(p,s)`) comes from the projected schema; a bare
@@ -671,7 +642,7 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                     };
                     let column_name = column_name.clone();
                     let v: Option<Vec<Option<Decimal>>> =
-                        row.try_get(i).context(FailedToGetRowValueSnafu {
+                        get(row, i).context(FailedToGetRowValueSnafu {
                             pg_type: Type::NUMERIC_ARRAY,
                         })?;
 
@@ -750,11 +721,11 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                         }
                         .fail();
                     };
-                    let v = row
-                        .try_get::<usize, Option<SystemTime>>(i)
-                        .with_context(|_| FailedToGetRowValueSnafu {
+                    let v = get::<Option<SystemTime>>(row, i).with_context(|_| {
+                        FailedToGetRowValueSnafu {
                             pg_type: Type::TIMESTAMP,
-                        })?;
+                        }
+                    })?;
 
                     match v {
                         Some(v) => {
@@ -770,11 +741,11 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                     }
                 }
                 Type::TIMESTAMPTZ => {
-                    let v = row
-                        .try_get::<usize, Option<DateTime<Utc>>>(i)
-                        .with_context(|_| FailedToGetRowValueSnafu {
+                    let v = get::<Option<DateTime<Utc>>>(row, i).with_context(|_| {
+                        FailedToGetRowValueSnafu {
                             pg_type: Type::TIMESTAMPTZ,
-                        })?;
+                        }
+                    })?;
 
                     let timestamptz_builder = builder.get_or_insert_with(|| {
                         Box::new(TimestampNanosecondBuilder::new().with_timezone("UTC"))
@@ -823,7 +794,7 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                         }
                         .fail();
                     };
-                    let v = row.try_get::<usize, Option<chrono::NaiveDate>>(i).context(
+                    let v = get::<Option<chrono::NaiveDate>>(row, i).context(
                         FailedToGetRowValueSnafu {
                             pg_type: Type::DATE,
                         },
@@ -844,11 +815,10 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                         }
                         .fail();
                     };
-                    let v = row.try_get::<usize, Option<uuid::Uuid>>(i).context(
-                        FailedToGetRowValueSnafu {
+                    let v =
+                        get::<Option<uuid::Uuid>>(row, i).context(FailedToGetRowValueSnafu {
                             pg_type: Type::UUID,
-                        },
-                    )?;
+                        })?;
 
                     match v {
                         Some(v) => builder.append_value(v.to_string()),
@@ -937,7 +907,7 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                         }
                         .fail();
                     };
-                    let v = row.try_get::<usize, Option<GeometryFromSql>>(i).context(
+                    let v = get::<Option<GeometryFromSql>>(row, i).context(
                         FailedToGetRowValueSnafu {
                             pg_type: postgres_type.clone(),
                         },
@@ -962,7 +932,7 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                         .fail();
                     };
                     let v: Option<Vec<GeometryFromSql>> =
-                        row.try_get(i).context(FailedToGetRowValueSnafu {
+                        get(row, i).context(FailedToGetRowValueSnafu {
                             pg_type: postgres_type.clone(),
                         })?;
                     match v {
@@ -988,7 +958,7 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                         }
                         .fail();
                     };
-                    let v = row.try_get::<usize, Option<SuperRawString>>(i).context(
+                    let v = get::<Option<SuperRawString>>(row, i).context(
                         FailedToGetRowValueSnafu {
                             pg_type: postgres_type.clone(),
                         },
@@ -1000,69 +970,6 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                     }
                 }
                 _ => match *postgres_type.kind() {
-                    // Array of a composite type (`my_struct[]`) → List<Struct>. Each array
-                    // element is a `CompositeType`; append it as a struct row in the list.
-                    Kind::Array(ref element_type)
-                        if matches!(*element_type.kind(), Kind::Composite(_)) =>
-                    {
-                        let Some(builder) = builder else {
-                            return NoBuilderForIndexSnafu { index: i }.fail();
-                        };
-                        let Some(list_builder) = builder
-                            .as_any_mut()
-                            .downcast_mut::<ListBuilder<StructBuilder>>()
-                        else {
-                            return FailedToDowncastBuilderSnafu {
-                                postgres_type: format!("{postgres_type}"),
-                            }
-                            .fail();
-                        };
-
-                        let v = row
-                            .try_get::<usize, Option<Vec<CompositeType>>>(i)
-                            .context(FailedToGetRowValueSnafu {
-                                pg_type: postgres_type.clone(),
-                            })?;
-
-                        let Some(composites) = v else {
-                            list_builder.append_null();
-                            continue;
-                        };
-
-                        let struct_builder = list_builder.values();
-                        for composite_type in &composites {
-                            append_composite_fields_to_struct!(composite_type, struct_builder);
-                            struct_builder.append(true);
-                        }
-                        list_builder.append(true);
-                    }
-                    Kind::Composite(_) => {
-                        let Some(builder) = builder else {
-                            return NoBuilderForIndexSnafu { index: i }.fail();
-                        };
-                        let Some(builder) = builder.as_any_mut().downcast_mut::<StructBuilder>()
-                        else {
-                            return FailedToDowncastBuilderSnafu {
-                                postgres_type: format!("{postgres_type}"),
-                            }
-                            .fail();
-                        };
-
-                        let v = row.try_get::<usize, Option<CompositeType>>(i).context(
-                            FailedToGetRowValueSnafu {
-                                pg_type: postgres_type.clone(),
-                            },
-                        )?;
-
-                        let Some(composite_type) = v else {
-                            builder.append_null();
-                            continue;
-                        };
-
-                        builder.append(true);
-
-                        append_composite_fields_to_struct!(composite_type, builder);
-                    }
                     Kind::Enum(_) => {
                         let Some(builder) = builder else {
                             return NoBuilderForIndexSnafu { index: i }.fail();
@@ -1077,7 +984,7 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                             .fail();
                         };
 
-                        let v = row.try_get::<usize, Option<EnumValueFromSql>>(i).context(
+                        let v = get::<Option<EnumValueFromSql>>(row, i).context(
                             FailedToGetRowValueSnafu {
                                 pg_type: postgres_type.clone(),
                             },
@@ -1250,6 +1157,10 @@ fn decode_json_complex_column(
 }
 
 fn map_column_type_to_data_type(column_type: &Type, field_name: &str) -> Result<Option<DataType>> {
+    // A domain maps as the type it is over, at any depth: a column, a composite's
+    // attribute, or an array's element.
+    let normalized = domain::normalized(column_type);
+    let column_type = &normalized;
     match *column_type {
         Type::INT2 => Ok(Some(DataType::Int16)),
         Type::INT4 => Ok(Some(DataType::Int32)),
@@ -1337,44 +1248,13 @@ fn map_column_type_to_data_type(column_type: &Type, field_name: &str) -> Result<
         // to the decoded type via `projected_json_complex_field`.
         _ if column_type.name() == "super" => Ok(Some(DataType::Utf8)),
         _ => match *column_type.kind() {
-            Kind::Composite(ref fields) => {
-                let mut arrow_fields = Vec::new();
-                for field in fields {
-                    let field_name = field.name();
-                    let field_type = map_column_type_to_data_type(field.type_(), field_name)?;
-                    match field_type {
-                        Some(field_type) => {
-                            arrow_fields.push(Field::new(field_name, field_type, true));
-                        }
-                        None => {
-                            return UnsupportedDataTypeSnafu {
-                                data_type: field.type_().to_string(),
-                                field_name: field_name.to_string(),
-                            }
-                            .fail();
-                        }
-                    }
-                }
-                Ok(Some(DataType::Struct(arrow_fields.into())))
-            }
             Kind::Enum(_) => Ok(Some(DataType::Dictionary(
                 Box::new(DataType::Int8),
                 Box::new(DataType::Utf8),
             ))),
-            // Array of a composite type (e.g. `my_struct[]`) → List<Struct>. The common
-            // scalar arrays (`int[]`, `text[]`, …) are matched by their explicit
-            // `Type::*_ARRAY` arms above; this catches user-defined composite arrays.
-            Kind::Array(ref element_type) if matches!(*element_type.kind(), Kind::Composite(_)) => {
-                let Some(element) = map_column_type_to_data_type(element_type, field_name)? else {
-                    return UnsupportedDataTypeSnafu {
-                        data_type: element_type.to_string(),
-                        field_name: field_name.to_string(),
-                    }
-                    .fail();
-                };
-                Ok(Some(DataType::List(Arc::new(Field::new(
-                    "item", element, true,
-                )))))
+            // Composites, and arrays no arm above handles, at any depth; see `nested`.
+            Kind::Composite(_) | Kind::Array(_) => {
+                nested::data_type(column_type, field_name).map(Some)
             }
             _ => UnsupportedDataTypeSnafu {
                 data_type: column_type.to_string(),
@@ -1586,6 +1466,7 @@ fn get_decimal_array_column_precision_and_scale(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::StructBuilder;
     use chrono::NaiveTime;
     use datafusion::arrow::array::{
         Array, ListArray, StringArray, StructArray, Time64NanosecondArray, Time64NanosecondBuilder,

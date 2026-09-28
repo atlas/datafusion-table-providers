@@ -198,8 +198,342 @@ async fn test_arrow_postgres_one_way(container_manager: &Mutex<ContainerManager>
     test_postgres_jsonb_list_struct_with_projected_schema(container_manager.port).await;
     test_postgres_json_list_struct_with_projected_schema(container_manager.port).await;
     test_postgres_composite_array_list_struct(container_manager.port).await;
+    test_postgres_domain_types(container_manager.port).await;
+    test_postgres_nested_composites(container_manager.port).await;
     test_postgres_sort_limit(container_manager.port).await;
     test_postgres_unconstrained_numeric_precision(container_manager.port).await;
+}
+
+/// A domain is read as the type it is over, wherever it appears: a column, a domain of a
+/// domain, a composite's attribute, an array's element, and a domain over a composite held
+/// in an array — the shape a list of structs takes when each element carries a check.
+async fn test_postgres_domain_types(port: usize) {
+    let pool = common::get_postgres_connection_pool(port)
+        .await
+        .expect("Postgres connection pool should be created");
+    let db_conn = pool
+        .connect_direct()
+        .await
+        .expect("Connection should be established");
+
+    db_conn
+        .conn
+        .batch_execute(
+            "DROP SCHEMA IF EXISTS domains CASCADE;
+            CREATE SCHEMA domains;
+            CREATE DOMAIN domains.positive AS integer CHECK (VALUE > 0);
+            CREATE DOMAIN domains.small AS domains.positive CHECK (VALUE < 100);
+            CREATE DOMAIN domains.code AS varchar(8);
+            CREATE DOMAIN domains.price AS numeric(10,2);
+            CREATE TYPE domains.line_item AS (sku domains.code, qty domains.positive);
+            CREATE DOMAIN domains.checked_item AS domains.line_item
+                CHECK (VALUE IS NULL OR (VALUE).qty IS NOT NULL);
+            CREATE TABLE domains.orders (
+                id domains.small PRIMARY KEY,
+                code domains.code,
+                price domains.price,
+                item domains.checked_item,
+                items domains.checked_item[],
+                counts domains.positive[]
+            );
+            INSERT INTO domains.orders VALUES
+                (1, 'A1', 9.99, ROW('a', 2),
+                 ARRAY[ROW('a', 2), ROW('b', 1)]::domains.checked_item[], ARRAY[1, 2]),
+                (2, NULL, NULL, NULL, ARRAY[]::domains.checked_item[], NULL);",
+        )
+        .await
+        .expect("Domain fixtures should be created");
+
+    let sqltable_pool: Arc<DynPostgresConnectionPool> = Arc::new(pool);
+    let table = SqlTable::new("postgres", &sqltable_pool, "domains.orders")
+        .await
+        .expect("SqlTable should infer a schema through domains");
+
+    let item = DataType::Struct(
+        vec![
+            Field::new("sku", DataType::Utf8, true),
+            Field::new("qty", DataType::Int32, true),
+        ]
+        .into(),
+    );
+    let inferred: Vec<(String, DataType)> = table
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| (f.name().clone(), f.data_type().clone()))
+        .collect();
+    let expected = vec![
+        ("id".to_string(), DataType::Int32),
+        ("code".to_string(), DataType::Utf8),
+        ("price".to_string(), DataType::Decimal128(10, 2)),
+        ("item".to_string(), item.clone()),
+        (
+            "items".to_string(),
+            DataType::List(Arc::new(Field::new("item", item, true))),
+        ),
+        (
+            "counts".to_string(),
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+        ),
+    ];
+    assert_eq!(inferred, expected, "each domain infers as its base type");
+
+    let source_type = |name: &str| {
+        table
+            .schema()
+            .field_with_name(name)
+            .unwrap()
+            .metadata()
+            .get(datafusion_table_providers::SOURCE_TYPE_METADATA_KEY)
+            .cloned()
+    };
+    assert_eq!(
+        source_type("price").as_deref(),
+        Some("domains.price"),
+        "the source type still names the domain"
+    );
+
+    let ctx = SessionContext::new();
+    ctx.register_table("orders", Arc::new(table))
+        .expect("Table should be registered");
+    let batches = ctx
+        .sql("SELECT * FROM orders ORDER BY id")
+        .await
+        .expect("DataFrame should be created from query")
+        .collect()
+        .await
+        .expect("Rows of domain columns should decode");
+
+    let printed = datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+        .unwrap()
+        .to_string();
+    let expected = "\
++----+------+-------+----------------+------------------------------------------+--------+
+| id | code | price | item           | items                                    | counts |
++----+------+-------+----------------+------------------------------------------+--------+
+| 1  | A1   | 9.99  | {sku: a, qty: 2} | [{sku: a, qty: 2}, {sku: b, qty: 1}]   | [1, 2] |
+| 2  |      |       |                |  []                                      |        |
++----+------+-------+----------------+------------------------------------------+--------+";
+    // Compared cell by cell rather than as a table, so column widths don't matter.
+    let cells = |table: &str| -> Vec<Vec<String>> {
+        table
+            .lines()
+            .filter(|line| line.starts_with('|'))
+            .map(|line| line.split('|').map(|c| c.trim().to_string()).collect())
+            .collect()
+    };
+    assert_eq!(cells(&printed), cells(expected), "{printed}");
+
+    db_conn
+        .conn
+        .batch_execute("DROP SCHEMA domains CASCADE;")
+        .await
+        .expect("Domain fixtures should be dropped");
+}
+
+/// Composites nest to any depth, and arrays of anything but the common scalars decode
+/// too: a struct holding a struct and a list of structs, each through a domain, with members
+/// of most scalar types, and nulls at every level. The layout is the one a table of
+/// checked, nested records takes.
+async fn test_postgres_nested_composites(port: usize) {
+    let pool = common::get_postgres_connection_pool(port)
+        .await
+        .expect("Postgres connection pool should be created");
+    let db_conn = pool
+        .connect_direct()
+        .await
+        .expect("Connection should be established");
+
+    db_conn
+        .conn
+        .batch_execute(
+            "DROP SCHEMA IF EXISTS nested CASCADE;
+            CREATE SCHEMA nested;
+            CREATE TYPE nested.owner AS (name text, since timestamptz);
+            CREATE DOMAIN nested.checked_owner AS nested.owner
+                CHECK (VALUE IS NOT DISTINCT FROM NULL OR (VALUE).name IS NOT NULL);
+            CREATE TYPE nested.tag AS (code text, n bigint);
+            CREATE DOMAIN nested.checked_tag AS nested.tag;
+            CREATE TYPE nested.record AS (
+                id uuid, flag boolean, count bigint, ratio double precision, day date,
+                doc jsonb, amount numeric(10,2),
+                owner nested.checked_owner, tags nested.checked_tag[]
+            );
+            CREATE DOMAIN nested.element AS nested.record CHECK (VALUE IS DISTINCT FROM NULL);
+            CREATE TABLE nested.records (
+                id int PRIMARY KEY,
+                one nested.record,
+                many nested.element[],
+                texts varchar(10)[],
+                times timestamptz[]
+            );
+            INSERT INTO nested.records VALUES
+                (1,
+                 ROW('00000000-0000-0000-0000-000000000001', true, 7, 0.5, '2026-09-28',
+                     '{\"a\": 1}', 12.34,
+                     ROW('ann', '2026-09-28 12:00:00+00')::nested.owner,
+                     ARRAY[ROW('x', 1)::nested.tag, ROW('y', NULL)::nested.tag])::nested.record,
+                 ARRAY[
+                     ROW('00000000-0000-0000-0000-000000000002', false, NULL, NULL, NULL, NULL,
+                         NULL, NULL, ARRAY[]::nested.checked_tag[])::nested.record
+                 ]::nested.element[],
+                 ARRAY['a', NULL]::varchar(10)[],
+                 ARRAY['2026-09-28 12:00:00+00'::timestamptz]),
+                (2, NULL, ARRAY[]::nested.element[], NULL, NULL),
+                (3, ROW(NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)::nested.record,
+                 NULL, ARRAY[]::varchar(10)[], NULL);",
+        )
+        .await
+        .expect("Nested fixtures should be created");
+
+    let sqltable_pool: Arc<DynPostgresConnectionPool> = Arc::new(pool);
+    let table = SqlTable::new("postgres", &sqltable_pool, "nested.records")
+        .await
+        .expect("SqlTable should infer a schema through nested composites");
+
+    let list = |item: DataType| DataType::List(Arc::new(Field::new("item", item, true)));
+    let utc = DataType::Timestamp(
+        datafusion::arrow::datatypes::TimeUnit::Nanosecond,
+        Some("UTC".into()),
+    );
+    let record = DataType::Struct(
+        vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("flag", DataType::Boolean, true),
+            Field::new("count", DataType::Int64, true),
+            Field::new("ratio", DataType::Float64, true),
+            Field::new("day", DataType::Date32, true),
+            Field::new("doc", DataType::Utf8, true),
+            Field::new("amount", DataType::Decimal128(10, 2), true),
+            Field::new(
+                "owner",
+                DataType::Struct(
+                    vec![
+                        Field::new("name", DataType::Utf8, true),
+                        Field::new("since", utc.clone(), true),
+                    ]
+                    .into(),
+                ),
+                true,
+            ),
+            Field::new(
+                "tags",
+                list(DataType::Struct(
+                    vec![
+                        Field::new("code", DataType::Utf8, true),
+                        Field::new("n", DataType::Int64, true),
+                    ]
+                    .into(),
+                )),
+                true,
+            ),
+        ]
+        .into(),
+    );
+    let types = |schema: SchemaRef| -> Vec<(String, DataType)> {
+        schema
+            .fields()
+            .iter()
+            .map(|f| (f.name().clone(), f.data_type().clone()))
+            .collect()
+    };
+    let expected = vec![
+        ("id".to_string(), DataType::Int32),
+        ("one".to_string(), record.clone()),
+        ("many".to_string(), list(record)),
+        ("texts".to_string(), list(DataType::Utf8)),
+        ("times".to_string(), list(utc)),
+    ];
+    assert_eq!(
+        types(table.schema()),
+        expected,
+        "nested types infer in full"
+    );
+
+    let ctx = SessionContext::new();
+    ctx.register_table("records", Arc::new(table))
+        .expect("Table should be registered");
+    let batches = ctx
+        .sql("SELECT * FROM records ORDER BY id")
+        .await
+        .expect("DataFrame should be created from query")
+        .collect()
+        .await
+        .expect("Rows of nested composites should decode");
+    assert_eq!(
+        types(batches[0].schema()),
+        expected,
+        "rows decode into exactly the inferred types"
+    );
+
+    let printed = datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+        .unwrap()
+        .to_string();
+    let cells: Vec<Vec<String>> = printed
+        .lines()
+        .filter(|line| line.starts_with('|'))
+        .skip(1)
+        .map(|line| {
+            line.trim_matches('|')
+                .split(" | ")
+                .map(|c| c.trim().to_string())
+                .collect()
+        })
+        .collect();
+    println!("{printed}");
+    assert_eq!(
+        cells,
+        vec![
+            vec![
+                "1".to_string(),
+                "{id: 00000000-0000-0000-0000-000000000001, flag: true, count: 7, ratio: 0.5, \
+                 day: 2026-09-28, doc: {\"a\": 1}, amount: 12.34, \
+                 owner: {name: ann, since: 2026-09-28T12:00:00Z}, \
+                 tags: [{code: x, n: 1}, {code: y, n: }]}"
+                    .to_string(),
+                "[{id: 00000000-0000-0000-0000-000000000002, flag: false, count: , ratio: , \
+                 day: , doc: , amount: , owner: , tags: []}]"
+                    .to_string(),
+                "[a, ]".to_string(),
+                "[2026-09-28T12:00:00Z]".to_string(),
+            ],
+            vec![
+                "2".to_string(),
+                String::new(),
+                "[]".to_string(),
+                String::new(),
+                String::new(),
+            ],
+            vec![
+                "3".to_string(),
+                "{id: , flag: , count: , ratio: , day: , doc: , amount: , owner: , tags: }"
+                    .to_string(),
+                String::new(),
+                "[]".to_string(),
+                String::new(),
+            ],
+        ],
+    );
+
+    // A member of a type nothing decodes fails the table, and does not panic.
+    db_conn
+        .conn
+        .batch_execute(
+            "CREATE TYPE nested.odd AS (at point);
+            CREATE TABLE nested.odds (id int, odd nested.odd);",
+        )
+        .await
+        .expect("Unsupported fixture should be created");
+    let Err(err) = SqlTable::new("postgres", &sqltable_pool, "nested.odds").await else {
+        panic!("A composite with an unsupported member should be refused");
+    };
+    assert!(err.to_string().contains("odd"), "{err}");
+
+    db_conn
+        .conn
+        .batch_execute("DROP SCHEMA nested CASCADE;")
+        .await
+        .expect("Nested fixtures should be dropped");
 }
 
 /// An unconstrained `numeric` column (what `max()`, `avg()` and arithmetic over `numeric`
