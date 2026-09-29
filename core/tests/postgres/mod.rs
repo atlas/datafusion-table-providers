@@ -30,6 +30,8 @@ use tokio::sync::{Mutex, MutexGuard};
 
 mod common;
 mod schema;
+#[cfg(any(feature = "postgres-native-tls", feature = "postgres-rustls"))]
+mod tls;
 
 async fn arrow_postgres_round_trip(
     port: usize,
