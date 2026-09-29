@@ -17,7 +17,7 @@ use bb8_postgres::tokio_postgres::types::ToSql;
 use datafusion_table_providers_common::util::handle_unsupported_type_error;
 use datafusion_table_providers_common::util::schema::SchemaValidator;
 use datafusion_table_providers_common::UnsupportedTypeAction;
-use datafusion_table_providers_common::SOURCE_TYPE_METADATA_KEY;
+use datafusion_table_providers_common::{SOURCE_BASE_TYPE_METADATA_KEY, SOURCE_TYPE_METADATA_KEY};
 
 fn maybe_db_source_err(err: tokio_postgres::Error) -> Box<dyn Error + Send + Sync> {
     if let Some(err) = err.as_db_error() {
@@ -177,7 +177,11 @@ SELECT
             )
         )
     END AS type_details,
-    c.typmod
+    c.typmod,
+    -- For a domain, the type it is over, formatted as a column of that type would be.
+    CASE WHEN c.declared_type <> c.type
+        THEN pg_catalog.format_type(c.type, c.typmod)
+    END AS source_base_type
 FROM columns c
 JOIN pg_type t ON t.oid = c.type
 -- An array's element, itself read as its base if it is a domain.
@@ -237,6 +241,23 @@ struct ColumnDef {
     /// The type modifier (`atttypmod`, through any domain); -1 when there is none or it is
     /// not known.
     typmod: i32,
+    /// For a domain, the type it is ultimately over. `None` for any other column.
+    source_base_type: Option<String>,
+}
+
+impl ColumnDef {
+    /// The Arrow field metadata recording the column's type as the source names it: the
+    /// Arrow mapping is lossy (`varchar(50)` and `citext` both land on `Utf8`).
+    fn metadata(&self) -> HashMap<String, String> {
+        let mut metadata = HashMap::from([(
+            SOURCE_TYPE_METADATA_KEY.to_string(),
+            self.source_type.clone(),
+        )]);
+        if let Some(base) = &self.source_base_type {
+            metadata.insert(SOURCE_BASE_TYPE_METADATA_KEY.to_string(), base.clone());
+        }
+        metadata
+    }
 }
 
 /// Quotes a SQL identifier for safe interpolation into a statement that can't use bind
@@ -474,9 +495,8 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
             if let Some(ty) = nested_types.get(&column.name) {
                 match nested::data_type_with(ty, column.typmod, &modifiers, &column.name) {
                     Ok(arrow_type) => fields.push(
-                        Field::new(column.name, arrow_type, column.nullable).with_metadata(
-                            HashMap::from([(SOURCE_TYPE_METADATA_KEY.to_string(), column.source_type)]),
-                        ),
+                        Field::new(&column.name, arrow_type, column.nullable)
+                            .with_metadata(column.metadata()),
                     ),
                     Err(_) => handle_unsupported_type_error(
                         self.unsupported_type_action,
@@ -492,8 +512,8 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
             let mut context =
                 ParseContext::new().with_unsupported_type_action(self.unsupported_type_action);
 
-            if let Some(type_details) = column.type_details {
-                context = context.with_type_details(type_details);
+            if let Some(type_details) = &column.type_details {
+                context = context.with_type_details(type_details.clone());
             };
 
             let Ok(arrow_type) =
@@ -510,12 +530,9 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
                 continue;
             };
 
-            // The Arrow mapping is lossy (`varchar(50)` and `citext` both land on
-            // `Utf8`), so keep the source type the catalog reported alongside it.
             fields.push(
-                Field::new(column.name, arrow_type, column.nullable).with_metadata(HashMap::from(
-                    [(SOURCE_TYPE_METADATA_KEY.to_string(), column.source_type)],
-                )),
+                Field::new(&column.name, arrow_type, column.nullable)
+                    .with_metadata(column.metadata()),
             );
         }
 
@@ -721,6 +738,7 @@ impl PostgresConnection {
                         nullable: row.get::<usize, String>(3) == "YES",
                         type_details: row.get::<usize, Option<serde_json::Value>>(4),
                         typmod: row.get::<usize, i32>(5),
+                        source_base_type: row.get::<usize, Option<String>>(6),
                     })
                     .collect()
             }
@@ -830,6 +848,7 @@ impl PostgresConnection {
                     nullable,
                     type_details: None,
                     typmod: -1,
+                    source_base_type: None,
                 }
             })
             .collect();

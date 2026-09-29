@@ -295,6 +295,28 @@ async fn test_postgres_domain_types(port: usize) {
         "the source type still names the domain"
     );
 
+    let base_type = |name: &str| {
+        table
+            .schema()
+            .field_with_name(name)
+            .unwrap()
+            .metadata()
+            .get(datafusion_table_providers::SOURCE_BASE_TYPE_METADATA_KEY)
+            .cloned()
+    };
+    assert_eq!(base_type("price").as_deref(), Some("numeric(10,2)"));
+    assert_eq!(
+        base_type("id").as_deref(),
+        Some("integer"),
+        "a domain of a domain is over the innermost base"
+    );
+    assert_eq!(base_type("code").as_deref(), Some("character varying(8)"));
+    assert_eq!(
+        base_type("items"),
+        None,
+        "an array of domains is an array, not a domain"
+    );
+
     let ctx = SessionContext::new();
     ctx.register_table("orders", Arc::new(table))
         .expect("Table should be registered");
