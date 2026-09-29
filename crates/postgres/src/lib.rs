@@ -1,6 +1,7 @@
 pub mod arrow_sql_gen;
 pub mod conn;
 pub mod pool;
+mod tls;
 
 use crate::arrow_sql_gen::statement_ext::CreateTableBuilderPostgresExt;
 use crate::conn::PostgresConnection;

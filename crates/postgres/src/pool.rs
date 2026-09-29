@@ -1,4 +1,11 @@
+// Every connector but `NoTls`, the one a build without TLS has, is `Clone` and not `Copy`.
+#![cfg_attr(
+    not(any(feature = "native-tls", feature = "rustls")),
+    allow(clippy::clone_on_copy)
+)]
+
 use crate::conn::PostgresConnection;
+use crate::tls;
 use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
 
 use async_trait::async_trait;
@@ -8,8 +15,6 @@ use datafusion_table_providers_common::{
     util::{self, ns_lookup::verify_ns_lookup_and_tcp_connect},
     UnsupportedTypeAction,
 };
-use native_tls::{Certificate, TlsConnector};
-use postgres_native_tls::MakeTlsConnector;
 use secrecy::{ExposeSecret, SecretBox, SecretString};
 use snafu::{prelude::*, ResultExt};
 use tokio::runtime::Handle;
@@ -22,6 +27,7 @@ use datafusion_table_providers_common::sql::db_connection_pool::{
 };
 
 #[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)))]
 pub enum Error {
     #[snafu(display("PostgreSQL connection failed.\n{source}\nFor details, refer to the PostgreSQL documentation: https://www.postgresql.org/docs/17/index.html"))]
     ConnectionPoolError {
@@ -64,10 +70,13 @@ pub enum Error {
     #[snafu(display(
         "Certificate loading failed.\n{source}\nEnsure the root certificate path points to a valid certificate."
     ))]
-    FailedToLoadCertError { source: native_tls::Error },
+    FailedToLoadCertError { source: BoxError },
 
     #[snafu(display("TLS connector initialization failed.\n{source}\nVerify SSL mode and root certificate validity"))]
-    FailedToBuildTlsConnectorError { source: native_tls::Error },
+    FailedToBuildTlsConnectorError { source: BoxError },
+
+    #[snafu(display("sslmode={ssl_mode} needs TLS, which this build has none of. Enable the `native-tls` or `rustls` feature, or connect with sslmode=disable."))]
+    TlsNotCompiled { ssl_mode: String },
 
     #[snafu(display("PostgreSQL connection failed.\n{source}\nFor details, refer to the PostgreSQL documentation: https://www.postgresql.org/docs/17/index.html"))]
     PostgresConnectionError { source: tokio_postgres::Error },
@@ -85,6 +94,9 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// The error of a TLS implementation, which varies with the one compiled in.
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Error type for the connection manager, covering both Postgres and password provider errors.
 #[derive(Debug)]
@@ -129,12 +141,12 @@ impl From<tokio_postgres::Error> for ConnectionManagerError {
 /// stored [`Config`] as-is.
 pub struct ConnectionManager {
     config: Config,
-    tls: MakeTlsConnector,
+    tls: tls::Connector,
     password_provider: Option<Arc<dyn PasswordProvider>>,
 }
 
 impl ConnectionManager {
-    fn new(config: Config, tls: MakeTlsConnector) -> Self {
+    fn new(config: Config, tls: tls::Connector) -> Self {
         Self {
             config,
             tls,
@@ -316,7 +328,7 @@ impl PostgresConnectionPool {
         if let Some(pg_sslmode) = params.get("sslmode").map(SecretBox::expose_secret) {
             match pg_sslmode.to_lowercase().as_str() {
                 "disable" | "require" | "prefer" | "verify-ca" | "verify-full" => {
-                    ssl_mode = pg_sslmode.to_string();
+                    ssl_mode = pg_sslmode.to_lowercase();
                 }
                 _ => {
                     InvalidParameterSnafu {
@@ -354,15 +366,11 @@ impl PostgresConnectionPool {
 
         verify_postgres_config(&config).await?;
 
-        let mut certs: Option<Vec<Certificate>> = None;
-
-        if let Some(path) = ssl_rootcert_path {
-            let buf = tokio::fs::read(path).await.context(FailedToReadCertSnafu)?;
-            certs = Some(parse_certs(&buf)?);
-        }
-
-        let tls_connector = get_tls_connector(ssl_mode.as_str(), certs)?;
-        let connector = MakeTlsConnector::new(tls_connector);
+        let root_certs = match ssl_rootcert_path {
+            Some(path) => Some(tokio::fs::read(path).await.context(FailedToReadCertSnafu)?),
+            None => None,
+        };
+        let connector = tls::connector(ssl_mode.as_str(), root_certs.as_deref())?;
 
         // Resolve the password provider: use the caller's, wrap the static password,
         // or leave as None for passwordless auth (trust, cert, etc.).
@@ -539,7 +547,7 @@ fn classify_connection_error(err: tokio_postgres::Error) -> Error {
     Error::PostgresConnectionError { source: err }
 }
 
-async fn test_connection(config: &Config, connector: MakeTlsConnector) -> Result<()> {
+async fn test_connection(config: &Config, connector: tls::Connector) -> Result<()> {
     config
         .connect(connector)
         .await
@@ -580,40 +588,6 @@ async fn verify_postgres_config(config: &Config) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn get_tls_connector(ssl_mode: &str, rootcerts: Option<Vec<Certificate>>) -> Result<TlsConnector> {
-    let mut builder = TlsConnector::builder();
-
-    if ssl_mode == "disable" {
-        return builder.build().context(FailedToBuildTlsConnectorSnafu);
-    }
-
-    if let Some(certs) = rootcerts {
-        for cert in certs {
-            builder.add_root_certificate(cert);
-        }
-    }
-
-    builder
-        .danger_accept_invalid_hostnames(ssl_mode != "verify-full")
-        .danger_accept_invalid_certs(ssl_mode != "verify-full" && ssl_mode != "verify-ca")
-        .build()
-        .context(FailedToBuildTlsConnectorSnafu)
-}
-
-fn parse_certs(buf: &[u8]) -> Result<Vec<Certificate>> {
-    Certificate::from_der(buf)
-        .map(|x| vec![x])
-        .or_else(|_| {
-            pem::parse_many(buf)
-                .unwrap_or_default()
-                .iter()
-                .map(pem::encode)
-                .map(|s| Certificate::from_pem(s.as_bytes()))
-                .collect()
-        })
-        .context(FailedToLoadCertSnafu)
 }
 
 #[derive(Debug, Clone, Copy)]
