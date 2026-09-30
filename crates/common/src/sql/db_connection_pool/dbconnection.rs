@@ -148,6 +148,15 @@ pub trait DbConnection<T, P>: Send {
     fn as_async(&self) -> Option<&dyn AsyncDbConnection<T, P>> {
         None
     }
+
+    /// Releases the connection once `stream`, which a query on it returned, no longer needs
+    /// it. By default that is at once.
+    fn release_after(
+        self: Box<Self>,
+        stream: SendableRecordBatchStream,
+    ) -> SendableRecordBatchStream {
+        stream
+    }
 }
 
 pub async fn get_tables<T: 'static, P: 'static>(
@@ -253,14 +262,15 @@ pub async fn query_arrow<T, P>(
     sql: String,
     projected_schema: Option<SchemaRef>,
 ) -> Result<SendableRecordBatchStream, Error> {
-    if let Some(conn) = conn.as_sync() {
+    let stream = if let Some(conn) = conn.as_sync() {
         conn.query_arrow(&sql, &[], projected_schema)
-            .context(UnableToQueryArrowSnafu {})
+            .context(UnableToQueryArrowSnafu {})?
     } else if let Some(conn) = conn.as_async() {
         conn.query_arrow(&sql, &[], projected_schema)
             .await
-            .context(UnableToQueryArrowSnafu {})
+            .context(UnableToQueryArrowSnafu {})?
     } else {
-        Err(Error::UnableToDowncastConnection {})
-    }
+        return Err(Error::UnableToDowncastConnection {});
+    };
+    Ok(conn.release_after(stream))
 }

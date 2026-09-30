@@ -35,7 +35,7 @@ sea-query = { version = "1.0.0", features = ["backend-postgres", "postgres-array
 secrecy = "0.10"
 serde_json = "1.0"
 snafu = "0.9"
-tokio = { version = "1.52", features = ["macros", "fs"] }
+tokio = { version = "1.52", features = ["macros", "fs", "rt", "time"] }
 tokio-postgres-rustls = { version = "0.14", default-features = false, optional = true }
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1", "with-geo-types-0_7"] }
 tracing = "0.1"

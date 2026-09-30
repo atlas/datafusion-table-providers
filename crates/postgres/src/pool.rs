@@ -6,7 +6,9 @@
 
 use crate::conn::PostgresConnection;
 use crate::tls;
-use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::{collections::HashMap, str::FromStr, sync::Arc};
 
 use async_trait::async_trait;
 use bb8::ErrorSink;
@@ -61,6 +63,16 @@ pub enum Error {
         "Invalid root certificate path: {path}. Ensure it points to a valid root certificate."
     ))]
     InvalidRootCertPathError { path: String },
+
+    #[snafu(display(
+        "sslrootcert and sslrootcert_pem are both set. Trust the roots in a file or in memory, not both."
+    ))]
+    ConflictingRootCertsError,
+
+    #[snafu(display(
+        "Invalid hostaddr. It must list one IP address for each host, separated by commas."
+    ))]
+    InvalidHostaddrError,
 
     #[snafu(display(
         "Failed to read certificate.\n{source}\nEnsure the root certificate path points to a valid certificate."
@@ -160,6 +172,27 @@ impl ConnectionManager {
     }
 }
 
+/// A pooled client. Once a request to cancel a query on it has been sent, the pool discards
+/// it rather than hand it out again, since that request could reach a later statement.
+pub struct PostgresClient {
+    client: tokio_postgres::Client,
+    pub(crate) cancelled: Arc<AtomicBool>,
+}
+
+impl Deref for PostgresClient {
+    type Target = tokio_postgres::Client;
+
+    fn deref(&self) -> &Self::Target {
+        &self.client
+    }
+}
+
+impl DerefMut for PostgresClient {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.client
+    }
+}
+
 /// Applies per-connection session configuration after a connection is established.
 ///
 /// Redshift surfaces Spectrum complex external columns (`ARRAY`/`STRUCT`/`MAP`) and
@@ -198,10 +231,10 @@ async fn configure_session(
 }
 
 impl bb8::ManageConnection for ConnectionManager {
-    type Connection = tokio_postgres::Client;
+    type Connection = PostgresClient;
     type Error = ConnectionManagerError;
 
-    async fn connect(&self) -> std::result::Result<tokio_postgres::Client, ConnectionManagerError> {
+    async fn connect(&self) -> std::result::Result<PostgresClient, ConnectionManagerError> {
         let (client, connection) = if let Some(provider) = &self.password_provider {
             let password = provider
                 .get_password()
@@ -221,28 +254,43 @@ impl bb8::ManageConnection for ConnectionManager {
 
         configure_session(&client).await?;
 
-        Ok(client)
+        Ok(PostgresClient {
+            client,
+            cancelled: Arc::default(),
+        })
     }
 
     async fn is_valid(
         &self,
-        conn: &mut tokio_postgres::Client,
+        conn: &mut PostgresClient,
     ) -> std::result::Result<(), ConnectionManagerError> {
         conn.simple_query("").await.map(|_| ())?;
         Ok(())
     }
 
-    fn has_broken(&self, conn: &mut tokio_postgres::Client) -> bool {
-        conn.is_closed()
+    fn has_broken(&self, conn: &mut PostgresClient) -> bool {
+        conn.is_closed() || conn.cancelled.load(Ordering::Relaxed)
     }
 }
 
-#[derive(Debug)]
 pub struct PostgresConnectionPool {
     pool: Arc<bb8::Pool<ConnectionManager>>,
+    /// The TLS the pool's connections are made with, which their cancel requests need too.
+    tls: tls::Connector,
     join_push_down: JoinPushDown,
     unsupported_type_action: UnsupportedTypeAction,
     io_handle: Option<Handle>,
+}
+
+impl std::fmt::Debug for PostgresConnectionPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresConnectionPool")
+            .field("pool", &self.pool)
+            .field("join_push_down", &self.join_push_down)
+            .field("unsupported_type_action", &self.unsupported_type_action)
+            .field("io_handle", &self.io_handle)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PostgresConnectionPool {
@@ -282,100 +330,18 @@ impl PostgresConnectionPool {
         // Remove the "pg_" prefix from the keys to keep backward compatibility
         let params = util::remove_prefix_from_hashmap_keys(params, "pg_");
 
-        let mut connection_string = String::new();
-        let mut ssl_mode = "verify-full".to_string();
-        let mut ssl_rootcert_path: Option<PathBuf> = None;
-        let mut static_password: Option<SecretString> = None;
-
-        if let Some(pg_connection_string) = params
-            .get("connection_string")
-            .map(SecretBox::expose_secret)
-        {
-            let (str, mode, cert_path, password) = parse_connection_string(pg_connection_string);
-            connection_string = str;
-            ssl_mode = mode;
-            if password_provider.is_none() {
-                static_password = password.map(SecretString::from);
-            }
-            if let Some(cert_path) = cert_path {
-                let sslrootcert = cert_path.as_str();
-                ensure!(
-                    std::path::Path::new(sslrootcert).exists(),
-                    InvalidRootCertPathSnafu { path: cert_path }
-                );
-                ssl_rootcert_path = Some(PathBuf::from(sslrootcert));
-            }
-        } else {
-            if let Some(pg_host) = params.get("host").map(SecretBox::expose_secret) {
-                connection_string.push_str(format!("host={pg_host} ").as_str());
-            }
-            if let Some(pg_user) = params.get("user").map(SecretBox::expose_secret) {
-                connection_string.push_str(format!("user={pg_user} ").as_str());
-            }
-            if let Some(pg_db) = params.get("db").map(SecretBox::expose_secret) {
-                connection_string.push_str(format!("dbname={pg_db} ").as_str());
-            }
-            if password_provider.is_none() {
-                if let Some(pg_pass) = params.get("pass") {
-                    static_password = Some(pg_pass.clone());
-                }
-            }
-            if let Some(pg_port) = params.get("port").map(SecretBox::expose_secret) {
-                connection_string.push_str(format!("port={pg_port} ").as_str());
-            }
+        let (config, verify) = config_from(&params)?;
+        if verify {
+            verify_postgres_config(&config).await?;
         }
 
-        if let Some(pg_sslmode) = params.get("sslmode").map(SecretBox::expose_secret) {
-            match pg_sslmode.to_lowercase().as_str() {
-                "disable" | "require" | "prefer" | "verify-ca" | "verify-full" => {
-                    ssl_mode = pg_sslmode.to_lowercase();
-                }
-                _ => {
-                    InvalidParameterSnafu {
-                        parameter_name: "sslmode".to_string(),
-                    }
-                    .fail()?;
-                }
-            }
-        }
-        if let Some(pg_sslrootcert) = params.get("sslrootcert").map(SecretBox::expose_secret) {
-            ensure!(
-                std::path::Path::new(pg_sslrootcert).exists(),
-                InvalidRootCertPathSnafu {
-                    path: pg_sslrootcert,
-                }
-            );
-
-            ssl_rootcert_path = Some(PathBuf::from(pg_sslrootcert));
-        }
-
-        let mode = match ssl_mode.as_str() {
-            "disable" => "disable",
-            "prefer" => "prefer",
-            // tokio_postgres supports only disable, require and prefer
-            _ => "require",
-        };
-
-        // Password is never included in the connection string — it flows
-        // through the PasswordProvider on each connection instead.
-        connection_string.push_str(format!("sslmode={mode} ").as_str());
-        let mut config =
-            Config::from_str(connection_string.as_str()).context(ConnectionPoolSnafu)?;
-
-        apply_optional_session_params(&mut config, &params);
-
-        verify_postgres_config(&config).await?;
-
-        let root_certs = match ssl_rootcert_path {
-            Some(path) => Some(tokio::fs::read(path).await.context(FailedToReadCertSnafu)?),
-            None => None,
-        };
-        let connector = tls::connector(ssl_mode.as_str(), root_certs.as_deref())?;
+        let root_certs = root_certs(&params).await?;
+        let connector = tls::connector(ssl_mode(&params)?.as_str(), root_certs.as_deref())?;
 
         // Resolve the password provider: use the caller's, wrap the static password,
         // or leave as None for passwordless auth (trust, cert, etc.).
         let password_provider = password_provider.or_else(|| {
-            static_password
+            static_password(&params)
                 .map(|pw| Arc::new(StaticPasswordProvider::new(pw)) as Arc<dyn PasswordProvider>)
         });
 
@@ -394,7 +360,7 @@ impl PostgresConnectionPool {
 
         let join_push_down = get_join_context(&config);
 
-        let mut manager = ConnectionManager::new(config, connector);
+        let mut manager = ConnectionManager::new(config, connector.clone());
         if let Some(provider) = password_provider {
             manager = manager.with_password_provider(provider);
         }
@@ -427,6 +393,7 @@ impl PostgresConnectionPool {
 
         Ok(PostgresConnectionPool {
             pool: Arc::new(pool),
+            tls: connector,
             join_push_down,
             unsupported_type_action: UnsupportedTypeAction::default(),
             io_handle: None,
@@ -462,7 +429,7 @@ impl PostgresConnectionPool {
         } else {
             pool.get_owned().await.map_err(map_pool_run_error)?
         };
-        Ok(PostgresConnection::new(conn))
+        Ok(PostgresConnection::new(conn).with_cancel_tls(self.tls.clone()))
     }
 }
 
@@ -498,6 +465,125 @@ fn parse_connection_string(
     }
 
     (connection_string, ssl_mode, ssl_rootcert_path, password)
+}
+
+/// The connection `params` configure, and whether to check first that its hosts resolve and
+/// accept TCP: not when `hostaddr` pins the addresses, which are then all that is contacted.
+fn config_from(params: &HashMap<String, SecretString>) -> Result<(Config, bool)> {
+    let mut connection_string = match params
+        .get("connection_string")
+        .map(SecretBox::expose_secret)
+    {
+        Some(pg_connection_string) => parse_connection_string(pg_connection_string).0,
+        None => {
+            let mut connection_string = String::new();
+            if let Some(pg_host) = params.get("host").map(SecretBox::expose_secret) {
+                connection_string.push_str(format!("host={pg_host} ").as_str());
+            }
+            if let Some(pg_user) = params.get("user").map(SecretBox::expose_secret) {
+                connection_string.push_str(format!("user={pg_user} ").as_str());
+            }
+            if let Some(pg_db) = params.get("db").map(SecretBox::expose_secret) {
+                connection_string.push_str(format!("dbname={pg_db} ").as_str());
+            }
+            if let Some(pg_port) = params.get("port").map(SecretBox::expose_secret) {
+                connection_string.push_str(format!("port={pg_port} ").as_str());
+            }
+            connection_string
+        }
+    };
+
+    let mode = match ssl_mode(params)?.as_str() {
+        "disable" => "disable",
+        "prefer" => "prefer",
+        // tokio_postgres supports only disable, require and prefer
+        _ => "require",
+    };
+
+    // Password is never included in the connection string — it flows
+    // through the PasswordProvider on each connection instead.
+    connection_string.push_str(format!("sslmode={mode} ").as_str());
+    let mut config = Config::from_str(connection_string.as_str()).context(ConnectionPoolSnafu)?;
+
+    apply_optional_session_params(&mut config, params);
+    apply_hostaddr(&mut config, params)?;
+
+    let verify = config.get_hostaddrs().is_empty();
+    Ok((config, verify))
+}
+
+/// Pins each host to the IP address at the same position in `hostaddr`: TCP goes to the
+/// address, and TLS verifies the host name.
+fn apply_hostaddr(config: &mut Config, params: &HashMap<String, SecretString>) -> Result<()> {
+    if let Some(hostaddr) = params.get("hostaddr").map(SecretBox::expose_secret) {
+        for addr in hostaddr.split(',') {
+            config.hostaddr(addr.parse().ok().context(InvalidHostaddrSnafu)?);
+        }
+    }
+    let hostaddrs = config.get_hostaddrs().len();
+    ensure!(
+        hostaddrs == 0 || hostaddrs == config.get_hosts().len(),
+        InvalidHostaddrSnafu
+    );
+    Ok(())
+}
+
+/// The `sslmode` param, else the connection string's, else `verify-full`.
+fn ssl_mode(params: &HashMap<String, SecretString>) -> Result<String> {
+    if let Some(pg_sslmode) = params.get("sslmode").map(SecretBox::expose_secret) {
+        let ssl_mode = pg_sslmode.to_lowercase();
+        ensure!(
+            matches!(
+                ssl_mode.as_str(),
+                "disable" | "require" | "prefer" | "verify-ca" | "verify-full"
+            ),
+            InvalidParameterSnafu {
+                parameter_name: "sslmode".to_string(),
+            }
+        );
+        return Ok(ssl_mode);
+    }
+    Ok(params
+        .get("connection_string")
+        .map(|s| parse_connection_string(s.expose_secret()).1)
+        .unwrap_or_else(|| "verify-full".to_string()))
+}
+
+/// The root certificates trusted besides the platform's: the contents of the `sslrootcert`
+/// file (the param's, else the connection string's), or `sslrootcert_pem` itself.
+async fn root_certs(params: &HashMap<String, SecretString>) -> Result<Option<Vec<u8>>> {
+    let path = params
+        .get("sslrootcert")
+        .map(|path| path.expose_secret().to_string())
+        .or_else(|| {
+            params
+                .get("connection_string")
+                .and_then(|s| parse_connection_string(s.expose_secret()).2)
+        });
+    match (path, params.get("sslrootcert_pem")) {
+        (Some(_), Some(_)) => ConflictingRootCertsSnafu.fail(),
+        (Some(path), None) => {
+            ensure!(
+                std::path::Path::new(&path).exists(),
+                InvalidRootCertPathSnafu { path: &path }
+            );
+            Ok(Some(
+                tokio::fs::read(path).await.context(FailedToReadCertSnafu)?,
+            ))
+        }
+        (None, Some(pem)) => Ok(Some(pem.expose_secret().as_bytes().to_vec())),
+        (None, None) => Ok(None),
+    }
+}
+
+/// The password in the connection string, or else the `pass` param when there is none.
+fn static_password(params: &HashMap<String, SecretString>) -> Option<SecretString> {
+    match params.get("connection_string") {
+        Some(s) => parse_connection_string(s.expose_secret())
+            .3
+            .map(SecretString::from),
+        None => params.get("pass").cloned(),
+    }
 }
 
 /// Apply the optional string session params libpq forwards verbatim to the
@@ -641,7 +727,8 @@ impl
         };
         Ok(Box::new(
             PostgresConnection::new(conn)
-                .with_unsupported_type_action(self.unsupported_type_action),
+                .with_unsupported_type_action(self.unsupported_type_action)
+                .with_cancel_tls(self.tls.clone()),
         ))
     }
 
@@ -654,6 +741,7 @@ impl
 mod tests {
     use super::*;
     use secrecy::ExposeSecret;
+    use std::net::{IpAddr, Ipv6Addr};
 
     #[tokio::test]
     async fn static_password_provider_returns_password() {
@@ -711,6 +799,97 @@ mod tests {
 
         assert_eq!(config.get_options(), Some("-c statement_timeout=5000"));
         assert_eq!(config.get_application_name(), Some("semvia"));
+    }
+
+    fn params(entries: &[(&str, &str)]) -> HashMap<String, SecretString> {
+        entries
+            .iter()
+            .map(|(name, value)| (name.to_string(), SecretString::from(value.to_string())))
+            .collect()
+    }
+
+    const PINNED: &[(&str, &str)] = &[
+        ("host", "customer.test"),
+        ("hostaddr", "127.0.0.1"),
+        ("port", "5432"),
+        ("db", "gis"),
+        ("user", "u"),
+    ];
+
+    fn params_without(name: &str) -> HashMap<String, SecretString> {
+        let mut params = params(PINNED);
+        params.remove(name);
+        params
+    }
+
+    fn test_ca_pem() -> String {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        rcgen::CertifiedIssuer::self_signed(params, rcgen::KeyPair::generate().unwrap())
+            .unwrap()
+            .pem()
+    }
+
+    #[test]
+    fn hostaddr_pins_every_host_and_skips_the_lookup() {
+        let (config, verify) = config_from(&params(&[
+            ("host", "customer.test,customer.test"),
+            ("hostaddr", "10.0.0.1,::1"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            config.get_hostaddrs(),
+            [
+                IpAddr::from([10, 0, 0, 1]),
+                IpAddr::from(Ipv6Addr::LOCALHOST)
+            ]
+        );
+        assert!(!verify);
+
+        let params = params(PINNED);
+        let (config, verify) = config_from(&params).unwrap();
+        assert_eq!(config.get_hostaddrs(), [IpAddr::from([127, 0, 0, 1])]);
+        assert!(!verify, "a pinned pool never resolves or probes the host");
+        let unpinned = config_from(&params_without("hostaddr")).unwrap();
+        assert!(unpinned.1);
+    }
+
+    #[test]
+    fn a_hostaddr_that_is_not_an_ip_literal_is_refused() {
+        assert!(config_from(&params(&[("host", "h"), ("hostaddr", "db.internal")])).is_err());
+        assert!(
+            config_from(&params(&[("host", "h"), ("hostaddr", "10.0.0.1,10.0.0.2")])).is_err(),
+            "one hostaddr per host"
+        );
+        assert!(
+            config_from(&params(&[("hostaddr", "10.0.0.1")])).is_err(),
+            "a hostaddr names the host TLS verifies"
+        );
+    }
+
+    #[cfg(feature = "rustls")]
+    #[test]
+    fn in_memory_roots_are_parsed_and_bad_pem_is_refused() {
+        assert!(tls::connector("verify-full", Some(test_ca_pem().as_bytes())).is_ok());
+        assert!(tls::connector("verify-full", Some(b"not pem")).is_err());
+    }
+
+    #[tokio::test]
+    async fn in_memory_roots_are_read_from_the_params() {
+        let pem = test_ca_pem();
+        let roots = root_certs(&params(&[("sslrootcert_pem", &pem)]))
+            .await
+            .unwrap();
+        assert_eq!(roots.as_deref(), Some(pem.as_bytes()));
+        assert!(
+            root_certs(&params(&[
+                ("sslrootcert_pem", &pem),
+                ("sslrootcert", "root.crt")
+            ]))
+            .await
+            .is_err(),
+            "roots come from a file or from memory, not both"
+        );
     }
 
     #[test]
