@@ -9,7 +9,8 @@
 //!   issued for.
 //! - `verify-full`: that, and it is issued for the host connected to.
 //!
-//! The trusted roots are the platform's, and those in `sslrootcert`.
+//! The trusted roots are the platform's, and those in the `sslrootcert` file or in
+//! `sslrootcert_pem`.
 
 pub(crate) use backend::{connector, Connector};
 
@@ -30,7 +31,7 @@ mod backend {
     pub(crate) type Connector = tokio_postgres_rustls::MakeRustlsConnect;
 
     /// The connector for `ssl_mode`, trusting the certificates in `root_certs` (the contents
-    /// of an `sslrootcert` file) besides the platform's.
+    /// of an `sslrootcert` file, or `sslrootcert_pem`) besides the platform's.
     pub(crate) fn connector(ssl_mode: &str, root_certs: Option<&[u8]>) -> Result<Connector> {
         // Named rather than taken from the process default, which is ambiguous — and
         // panics — when a build links more than one provider.
@@ -214,7 +215,7 @@ mod backend {
     pub(crate) type Connector = postgres_native_tls::MakeTlsConnector;
 
     /// The connector for `ssl_mode`, trusting the certificates in `root_certs` (the contents
-    /// of an `sslrootcert` file) besides the platform's.
+    /// of an `sslrootcert` file, or `sslrootcert_pem`) besides the platform's.
     pub(crate) fn connector(ssl_mode: &str, root_certs: Option<&[u8]>) -> Result<Connector> {
         let mut builder = TlsConnector::builder();
 
