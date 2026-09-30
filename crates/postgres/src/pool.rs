@@ -6,6 +6,8 @@
 
 use crate::conn::PostgresConnection;
 use crate::tls;
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::HashMap, str::FromStr, sync::Arc};
 
 use async_trait::async_trait;
@@ -170,6 +172,27 @@ impl ConnectionManager {
     }
 }
 
+/// A pooled client. Once a request to cancel a query on it has been sent, the pool discards
+/// it rather than hand it out again, since that request could reach a later statement.
+pub struct PostgresClient {
+    client: tokio_postgres::Client,
+    pub(crate) cancelled: Arc<AtomicBool>,
+}
+
+impl Deref for PostgresClient {
+    type Target = tokio_postgres::Client;
+
+    fn deref(&self) -> &Self::Target {
+        &self.client
+    }
+}
+
+impl DerefMut for PostgresClient {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.client
+    }
+}
+
 /// Applies per-connection session configuration after a connection is established.
 ///
 /// Redshift surfaces Spectrum complex external columns (`ARRAY`/`STRUCT`/`MAP`) and
@@ -208,10 +231,10 @@ async fn configure_session(
 }
 
 impl bb8::ManageConnection for ConnectionManager {
-    type Connection = tokio_postgres::Client;
+    type Connection = PostgresClient;
     type Error = ConnectionManagerError;
 
-    async fn connect(&self) -> std::result::Result<tokio_postgres::Client, ConnectionManagerError> {
+    async fn connect(&self) -> std::result::Result<PostgresClient, ConnectionManagerError> {
         let (client, connection) = if let Some(provider) = &self.password_provider {
             let password = provider
                 .get_password()
@@ -231,19 +254,22 @@ impl bb8::ManageConnection for ConnectionManager {
 
         configure_session(&client).await?;
 
-        Ok(client)
+        Ok(PostgresClient {
+            client,
+            cancelled: Arc::default(),
+        })
     }
 
     async fn is_valid(
         &self,
-        conn: &mut tokio_postgres::Client,
+        conn: &mut PostgresClient,
     ) -> std::result::Result<(), ConnectionManagerError> {
         conn.simple_query("").await.map(|_| ())?;
         Ok(())
     }
 
-    fn has_broken(&self, conn: &mut tokio_postgres::Client) -> bool {
-        conn.is_closed()
+    fn has_broken(&self, conn: &mut PostgresClient) -> bool {
+        conn.is_closed() || conn.cancelled.load(Ordering::Relaxed)
     }
 }
 

@@ -30,7 +30,8 @@ fn maybe_db_source_err(err: tokio_postgres::Error) -> Box<dyn Error + Send + Syn
 
 /// A pooled Postgres connection obtained from a [`PostgresConnectionPool`](crate::pool::PostgresConnectionPool).
 ///
-/// Dereferences to [`tokio_postgres::Client`](bb8_postgres::tokio_postgres::Client) for executing queries.
+/// Dereferences to a [`PostgresClient`](crate::pool::PostgresClient), and through it to
+/// [`tokio_postgres::Client`](bb8_postgres::tokio_postgres::Client), for executing queries.
 // Defined here rather than in `postgrespool` to avoid a type-resolution cycle
 // between the two modules (postgrespool imports PostgresConnection, which uses
 // this alias).
@@ -38,11 +39,13 @@ pub type PostgresPooledConnection = bb8::PooledConnection<'static, ConnectionMan
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::RecordBatchStream;
 use datafusion::sql::TableReference;
 use futures::stream;
 use futures::Stream;
 use futures::StreamExt;
 use std::pin::Pin;
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -431,6 +434,34 @@ pub struct PostgresConnection {
     cancel_tls: Option<tls::Connector>,
 }
 
+/// A query's batches, holding the connection they are read from until they end or are
+/// dropped, so the pool cannot hand the connection to another query meanwhile.
+struct HoldingConnection {
+    schema: SchemaRef,
+    // Declared before `conn`, so it is dropped first: dropping it unfinished sends the cancel
+    // request, after which the pool discards the connection instead of reusing it.
+    batches: SendableRecordBatchStream,
+    conn: Option<Box<PostgresConnection>>,
+}
+
+impl Stream for HoldingConnection {
+    type Item = datafusion::error::Result<arrow::array::RecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let polled = self.batches.poll_next_unpin(cx);
+        if let Poll::Ready(None) = polled {
+            self.conn = None;
+        }
+        polled
+    }
+}
+
+impl RecordBatchStream for HoldingConnection {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
+
 impl SchemaValidator for PostgresConnection {
     type Error = datafusion_table_providers_common::sql::db_connection_pool::dbconnection::Error;
 
@@ -459,6 +490,17 @@ impl<'a> DbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)> for Post
         &self,
     ) -> Option<&dyn AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>> {
         Some(self)
+    }
+
+    fn release_after(
+        self: Box<Self>,
+        stream: SendableRecordBatchStream,
+    ) -> SendableRecordBatchStream {
+        Box::pin(HoldingConnection {
+            schema: stream.schema(),
+            batches: stream,
+            conn: Some(self),
+        })
     }
 }
 
@@ -667,7 +709,8 @@ impl PostgresConnection {
     }
 
     /// Asks the server to cancel the query this connection is running, from a task of its
-    /// own that gives up after [`CANCEL_TIMEOUT`]. Taken before the query is sent.
+    /// own that gives up after [`CANCEL_TIMEOUT`], and has the pool discard the connection.
+    /// Taken before the query is sent.
     #[cfg_attr(
         not(any(feature = "native-tls", feature = "rustls")),
         allow(clippy::clone_on_copy)
@@ -676,10 +719,12 @@ impl PostgresConnection {
         let token = self.conn.cancel_token();
         let tls = self.cancel_tls.clone();
         let runtime = tokio::runtime::Handle::try_current().ok();
+        let cancelled = Arc::clone(&self.conn.cancelled);
         move || {
             let (Some(tls), Some(runtime)) = (tls, runtime) else {
                 return;
             };
+            cancelled.store(true, Ordering::Relaxed);
             runtime.spawn(async move {
                 match tokio::time::timeout(CANCEL_TIMEOUT, token.cancel_query(tls)).await {
                     Ok(Ok(())) => {}

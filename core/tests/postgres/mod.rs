@@ -20,7 +20,7 @@ use datafusion_federation::schema_cast::record_convert::try_cast_to;
 use datafusion_table_providers::{
     postgres::{DynPostgresConnectionPool, PostgresTableProviderFactory},
     sql::db_connection_pool::postgrespool::PostgresConnectionPool,
-    sql::sql_provider_datafusion::SqlTable,
+    sql::sql_provider_datafusion::{get_stream, SqlTable},
     util::secrets::to_secret_map,
     UnsupportedTypeAction,
 };
@@ -1477,5 +1477,67 @@ async fn test_postgres_pinned_address_and_cancel_on_drop(
             "the query whose rows were dropped is still running"
         );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// A stream dropped before its end keeps its connection until the request to cancel its query
+/// has completed, so the cancel never reaches the next statement run on that connection.
+#[rstest]
+#[test_log::test(tokio::test)]
+async fn test_postgres_cancel_never_reaches_the_next_statement(
+    container_manager: &Mutex<ContainerManager>,
+) {
+    let mut container_manager = container_manager.lock().await;
+    if !container_manager.claimed {
+        container_manager.claimed = true;
+        start_container(&mut container_manager).await;
+    }
+
+    let mut params = common::get_pg_params(container_manager.port);
+    params.insert("pg_connection_pool_size".to_string(), "1".to_string());
+    let pool: Arc<DynPostgresConnectionPool> = Arc::new(
+        PostgresConnectionPool::new(to_secret_map(params))
+            .await
+            .expect("Postgres connection pool should be created"),
+    );
+
+    // One row past the first batch: the server has finished the query while the client still
+    // holds a row unread, so the cancel for it can only reach whatever runs next. Whether it
+    // arrives before or during that statement is a race, so it is run often enough to lose it.
+    for _ in 0..30 {
+        let mut rows = get_stream(
+            Arc::clone(&pool),
+            "SELECT g FROM generate_series(1, 4001) g".to_string(),
+            Arc::new(Schema::new(vec![Field::new("g", DataType::Int32, true)])),
+        )
+        .await
+        .expect("query should work");
+        futures::StreamExt::next(&mut rows)
+            .await
+            .expect("a first batch")
+            .expect("the first batch should be readable");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(rows);
+
+        let next = get_stream(
+            Arc::clone(&pool),
+            "SELECT true AS slept FROM pg_sleep(0.3)".to_string(),
+            Arc::new(Schema::new(vec![Field::new(
+                "slept",
+                DataType::Boolean,
+                true,
+            )])),
+        )
+        .await
+        .expect("the next statement should not be cancelled");
+        let batches = futures::StreamExt::collect::<Vec<_>>(next).await;
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0]
+                .as_ref()
+                .expect("the next statement should not be cancelled")
+                .num_rows(),
+            1
+        );
     }
 }
