@@ -19,7 +19,9 @@ use datafusion_federation::schema_cast::record_convert::try_cast_to;
 
 use datafusion_table_providers::{
     postgres::{DynPostgresConnectionPool, PostgresTableProviderFactory},
-    sql::sql_provider_datafusion::SqlTable,
+    sql::db_connection_pool::postgrespool::PostgresConnectionPool,
+    sql::sql_provider_datafusion::{get_stream, SqlTable},
+    util::secrets::to_secret_map,
     UnsupportedTypeAction,
 };
 use rstest::{fixture, rstest};
@@ -1406,4 +1408,136 @@ async fn test_postgres_io_runtime_segregation(container_manager: &Mutex<Containe
     assert!(!batches.is_empty(), "should return results via IO runtime");
 
     io_runtime.shutdown_background();
+}
+
+/// A pool given `hostaddr` reaches the server there without resolving `host`, and a query
+/// whose rows are dropped unread is cancelled on the server rather than left running.
+#[rstest]
+#[test_log::test(tokio::test)]
+async fn test_postgres_pinned_address_and_cancel_on_drop(
+    container_manager: &Mutex<ContainerManager>,
+) {
+    let mut container_manager = container_manager.lock().await;
+    if !container_manager.claimed {
+        container_manager.claimed = true;
+        start_container(&mut container_manager).await;
+    }
+
+    let mut params = common::get_pg_params(container_manager.port);
+    // `.invalid` resolves nowhere, so only the pinned address reaches the server.
+    params.insert("pg_host".to_string(), "customer.invalid".to_string());
+    params.insert("pg_hostaddr".to_string(), "127.0.0.1".to_string());
+    let pool = PostgresConnectionPool::new(to_secret_map(params))
+        .await
+        .expect("a pinned pool should connect without resolving its host");
+    let pool: Arc<DynPostgresConnectionPool> = Arc::new(pool);
+    let conn = pool.connect().await.expect("connect should work");
+    let async_conn = conn.as_async().expect("should be async connection");
+
+    // The first batch arrives at once; the row after the rest takes a minute.
+    let mut rows = async_conn
+        .query_arrow(
+            "SELECT g FROM generate_series(1, 20001) g \
+             WHERE g <= 20000 OR (SELECT true FROM pg_sleep(60) WHERE g > 20000)",
+            &[],
+            None,
+        )
+        .await
+        .expect("query should work");
+    futures::StreamExt::next(&mut rows)
+        .await
+        .expect("a first batch")
+        .expect("the first batch should be readable");
+    drop(rows);
+
+    let admin = common::get_postgres_connection_pool(container_manager.port)
+        .await
+        .expect("Postgres connection pool should be created")
+        .connect_direct()
+        .await
+        .expect("Connection should be established");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let running: i64 = admin
+            .conn
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE state = 'active' AND query LIKE '%pg_sleep(60)%' \
+                 AND pid <> pg_backend_pid()",
+                &[],
+            )
+            .await
+            .expect("pg_stat_activity should be readable")
+            .get(0);
+        if running == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the query whose rows were dropped is still running"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// A stream dropped before its end keeps its connection until the request to cancel its query
+/// has completed, so the cancel never reaches the next statement run on that connection.
+#[rstest]
+#[test_log::test(tokio::test)]
+async fn test_postgres_cancel_never_reaches_the_next_statement(
+    container_manager: &Mutex<ContainerManager>,
+) {
+    let mut container_manager = container_manager.lock().await;
+    if !container_manager.claimed {
+        container_manager.claimed = true;
+        start_container(&mut container_manager).await;
+    }
+
+    let mut params = common::get_pg_params(container_manager.port);
+    params.insert("pg_connection_pool_size".to_string(), "1".to_string());
+    let pool: Arc<DynPostgresConnectionPool> = Arc::new(
+        PostgresConnectionPool::new(to_secret_map(params))
+            .await
+            .expect("Postgres connection pool should be created"),
+    );
+
+    // One row past the first batch: the server has finished the query while the client still
+    // holds a row unread, so the cancel for it can only reach whatever runs next. Whether it
+    // arrives before or during that statement is a race, so it is run often enough to lose it.
+    for _ in 0..30 {
+        let mut rows = get_stream(
+            Arc::clone(&pool),
+            "SELECT g FROM generate_series(1, 4001) g".to_string(),
+            Arc::new(Schema::new(vec![Field::new("g", DataType::Int32, true)])),
+        )
+        .await
+        .expect("query should work");
+        futures::StreamExt::next(&mut rows)
+            .await
+            .expect("a first batch")
+            .expect("the first batch should be readable");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(rows);
+
+        let next = get_stream(
+            Arc::clone(&pool),
+            "SELECT true AS slept FROM pg_sleep(0.3)".to_string(),
+            Arc::new(Schema::new(vec![Field::new(
+                "slept",
+                DataType::Boolean,
+                true,
+            )])),
+        )
+        .await
+        .expect("the next statement should not be cancelled");
+        let batches = futures::StreamExt::collect::<Vec<_>>(next).await;
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0]
+                .as_ref()
+                .expect("the next statement should not be cancelled")
+                .num_rows(),
+            1
+        );
+    }
 }

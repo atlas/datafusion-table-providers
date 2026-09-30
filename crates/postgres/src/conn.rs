@@ -8,6 +8,7 @@ use crate::arrow_sql_gen::rows_to_arrow;
 use crate::arrow_sql_gen::schema::pg_data_type_to_arrow_type;
 use crate::arrow_sql_gen::schema::ParseContext;
 use crate::pool::ConnectionManager;
+use crate::tls;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
 use arrow::datatypes::SchemaRef;
@@ -29,7 +30,8 @@ fn maybe_db_source_err(err: tokio_postgres::Error) -> Box<dyn Error + Send + Syn
 
 /// A pooled Postgres connection obtained from a [`PostgresConnectionPool`](crate::pool::PostgresConnectionPool).
 ///
-/// Dereferences to [`tokio_postgres::Client`](bb8_postgres::tokio_postgres::Client) for executing queries.
+/// Dereferences to a [`PostgresClient`](crate::pool::PostgresClient), and through it to
+/// [`tokio_postgres::Client`](bb8_postgres::tokio_postgres::Client), for executing queries.
 // Defined here rather than in `postgrespool` to avoid a type-resolution cycle
 // between the two modules (postgrespool imports PostgresConnection, which uses
 // this alias).
@@ -37,9 +39,15 @@ pub type PostgresPooledConnection = bb8::PooledConnection<'static, ConnectionMan
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::RecordBatchStream;
 use datafusion::sql::TableReference;
 use futures::stream;
+use futures::Stream;
 use futures::StreamExt;
+use std::pin::Pin;
+use std::sync::atomic::Ordering;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use snafu::prelude::*;
 use tokio_postgres::Row;
@@ -375,9 +383,83 @@ fn format_postgres_query_error(source: &bb8_postgres::tokio_postgres::Error) -> 
     rendered
 }
 
+/// How long a request to cancel a query may take before it is abandoned.
+const CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A query's rows that, dropped before they end, have the server stop producing them rather
+/// than run the query to completion, or its timeout, for no one.
+struct CancelOnDrop<S, F: FnOnce()> {
+    rows: S,
+    cancel: Option<F>,
+}
+
+impl<S, F: FnOnce()> CancelOnDrop<S, F> {
+    fn new(rows: S, cancel: F) -> Self {
+        Self {
+            rows,
+            cancel: Some(cancel),
+        }
+    }
+}
+
+impl<S, T, E, F> Stream for CancelOnDrop<S, F>
+where
+    S: Stream<Item = std::result::Result<T, E>> + Unpin,
+    F: FnOnce() + Unpin,
+{
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let polled = self.rows.poll_next_unpin(cx);
+        // After its end or an error, the statement is no longer running.
+        if matches!(polled, Poll::Ready(None | Some(Err(_)))) {
+            self.cancel = None;
+        }
+        polled
+    }
+}
+
+impl<S, F: FnOnce()> Drop for CancelOnDrop<S, F> {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            cancel();
+        }
+    }
+}
+
 pub struct PostgresConnection {
     pub conn: PostgresPooledConnection,
     unsupported_type_action: UnsupportedTypeAction,
+    /// The TLS a request to cancel a query connects with; without it, none is sent.
+    cancel_tls: Option<tls::Connector>,
+}
+
+/// A query's batches, holding the connection they are read from until they end or are
+/// dropped, so the pool cannot hand the connection to another query meanwhile.
+struct HoldingConnection {
+    schema: SchemaRef,
+    // Declared before `conn`, so it is dropped first: dropping it unfinished sends the cancel
+    // request, after which the pool discards the connection instead of reusing it.
+    batches: SendableRecordBatchStream,
+    conn: Option<Box<PostgresConnection>>,
+}
+
+impl Stream for HoldingConnection {
+    type Item = datafusion::error::Result<arrow::array::RecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let polled = self.batches.poll_next_unpin(cx);
+        if let Poll::Ready(None) = polled {
+            self.conn = None;
+        }
+        polled
+    }
+}
+
+impl RecordBatchStream for HoldingConnection {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
 }
 
 impl SchemaValidator for PostgresConnection {
@@ -409,6 +491,17 @@ impl<'a> DbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)> for Post
     ) -> Option<&dyn AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>> {
         Some(self)
     }
+
+    fn release_after(
+        self: Box<Self>,
+        stream: SendableRecordBatchStream,
+    ) -> SendableRecordBatchStream {
+        Box::pin(HoldingConnection {
+            schema: stream.schema(),
+            batches: stream,
+            conn: Some(self),
+        })
+    }
 }
 
 #[async_trait::async_trait]
@@ -419,6 +512,7 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
         PostgresConnection {
             conn,
             unsupported_type_action: UnsupportedTypeAction::default(),
+            cancel_tls: None,
         }
     }
 
@@ -548,11 +642,13 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
     ) -> Result<SendableRecordBatchStream> {
         // TODO: We should have a way to detect if params have been passed
         // if they haven't we should use .copy_out instead, because it should be much faster
+        let cancel = self.canceller();
         let streamable = self
             .conn
             .query_raw(sql, params.iter().copied()) // use .query_raw to get access to the underlying RowStream
             .await
             .context(QuerySnafu)?;
+        let streamable = CancelOnDrop::new(Box::pin(streamable), cancel);
 
         // chunk the stream into groups of rows
         let mut stream = streamable.chunks(4_000).boxed().map(move |rows| {
@@ -604,6 +700,39 @@ impl PostgresConnection {
     pub fn with_unsupported_type_action(mut self, action: UnsupportedTypeAction) -> Self {
         self.unsupported_type_action = action;
         self
+    }
+
+    #[must_use]
+    pub(crate) fn with_cancel_tls(mut self, tls: tls::Connector) -> Self {
+        self.cancel_tls = Some(tls);
+        self
+    }
+
+    /// Asks the server to cancel the query this connection is running, from a task of its
+    /// own that gives up after [`CANCEL_TIMEOUT`], and has the pool discard the connection.
+    /// Taken before the query is sent.
+    #[cfg_attr(
+        not(any(feature = "native-tls", feature = "rustls")),
+        allow(clippy::clone_on_copy)
+    )]
+    fn canceller(&self) -> impl FnOnce() + Send + Unpin + 'static {
+        let token = self.conn.cancel_token();
+        let tls = self.cancel_tls.clone();
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        let cancelled = Arc::clone(&self.conn.cancelled);
+        move || {
+            let (Some(tls), Some(runtime)) = (tls, runtime) else {
+                return;
+            };
+            cancelled.store(true, Ordering::Relaxed);
+            runtime.spawn(async move {
+                match tokio::time::timeout(CANCEL_TIMEOUT, token.cancel_query(tls)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::debug!("could not cancel a postgres query: {e}"),
+                    Err(_) => tracing::debug!("cancelling a postgres query timed out"),
+                }
+            });
+        }
     }
 
     pub async fn get_variant(
@@ -904,5 +1033,48 @@ impl PostgresConnection {
             })?;
 
         Ok(rec.schema())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CancelOnDrop;
+    use futures::{stream, StreamExt};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    type Rows = stream::Iter<std::vec::IntoIter<Result<u8, ()>>>;
+
+    fn rows(items: Vec<Result<u8, ()>>) -> (CancelOnDrop<Rows, impl FnOnce()>, Arc<AtomicBool>) {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancelled);
+        let rows = CancelOnDrop::new(stream::iter(items), move || {
+            flag.store(true, Ordering::SeqCst)
+        });
+        (rows, cancelled)
+    }
+
+    #[tokio::test]
+    async fn a_stream_dropped_before_its_end_cancels_its_query() {
+        let (mut unread, cancelled) = rows(vec![Ok(1), Ok(2)]);
+        assert_eq!(unread.next().await, Some(Ok(1)));
+        assert!(!cancelled.load(Ordering::SeqCst));
+        drop(unread);
+        assert!(cancelled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_ended_cancels_nothing() {
+        let (read, cancelled) = rows(vec![Ok(1), Ok(2)]);
+        assert_eq!(read.collect::<Vec<_>>().await, [Ok(1), Ok(2)]);
+        assert!(!cancelled.load(Ordering::SeqCst));
+
+        let (mut failed, cancelled) = rows(vec![Err(()), Ok(2)]);
+        assert_eq!(failed.next().await, Some(Err(())));
+        drop(failed);
+        assert!(
+            !cancelled.load(Ordering::SeqCst),
+            "a statement that failed is no longer running"
+        );
     }
 }
