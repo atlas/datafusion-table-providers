@@ -1480,8 +1480,8 @@ async fn test_postgres_pinned_address_and_cancel_on_drop(
     }
 }
 
-/// A stream dropped before its end keeps its connection until the request to cancel its query
-/// has completed, so the cancel never reaches the next statement run on that connection.
+/// A connection whose stream was dropped before its end is discarded by the pool, so the
+/// request to cancel its query never reaches the next statement.
 #[rstest]
 #[test_log::test(tokio::test)]
 async fn test_postgres_cancel_never_reaches_the_next_statement(
@@ -1540,4 +1540,135 @@ async fn test_postgres_cancel_never_reaches_the_next_statement(
             1
         );
     }
+}
+
+async fn backend_pid(pool: &PostgresConnectionPool) -> i32 {
+    pool.connect_direct()
+        .await
+        .expect("Connection should be established")
+        .conn
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("pg_backend_pid should be readable")
+        .get(0)
+}
+
+async fn single_connection_pool(port: usize) -> Arc<PostgresConnectionPool> {
+    let mut params = common::get_pg_params(port);
+    params.insert("pg_connection_pool_size".to_string(), "1".to_string());
+    Arc::new(
+        PostgresConnectionPool::new(to_secret_map(params))
+            .await
+            .expect("Postgres connection pool should be created"),
+    )
+}
+
+/// The pool discards the connection a stream was dropped unfinished on, and keeps the one a
+/// stream was read to its end on.
+#[rstest]
+#[test_log::test(tokio::test)]
+async fn test_postgres_a_cancelled_connection_is_discarded(
+    container_manager: &Mutex<ContainerManager>,
+) {
+    let mut container_manager = container_manager.lock().await;
+    if !container_manager.claimed {
+        container_manager.claimed = true;
+        start_container(&mut container_manager).await;
+    }
+
+    let pool = single_connection_pool(container_manager.port).await;
+    let before = backend_pid(&pool).await;
+
+    let mut rows = get_stream(
+        Arc::clone(&pool) as Arc<DynPostgresConnectionPool>,
+        "SELECT g FROM generate_series(1, 4001) g".to_string(),
+        Arc::new(Schema::new(vec![Field::new("g", DataType::Int32, true)])),
+    )
+    .await
+    .expect("query should work");
+    futures::StreamExt::next(&mut rows)
+        .await
+        .expect("a first batch")
+        .expect("the first batch should be readable");
+    drop(rows);
+    let after_drop = backend_pid(&pool).await;
+    assert_ne!(after_drop, before, "a cancelled connection is not reused");
+
+    let read = get_stream(
+        Arc::clone(&pool) as Arc<DynPostgresConnectionPool>,
+        "SELECT g FROM generate_series(1, 4001) g".to_string(),
+        Arc::new(Schema::new(vec![Field::new("g", DataType::Int32, true)])),
+    )
+    .await
+    .expect("query should work");
+    let batches = futures::StreamExt::collect::<Vec<_>>(read).await;
+    assert!(batches.iter().all(Result::is_ok));
+    assert_eq!(backend_pid(&pool).await, after_drop, "a finished one is");
+}
+
+/// A query abandoned before its first row, while the server is still working on it, is
+/// cancelled, and its connection is not reused.
+#[rstest]
+#[test_log::test(tokio::test)]
+async fn test_postgres_a_query_abandoned_before_its_first_row_is_cancelled(
+    container_manager: &Mutex<ContainerManager>,
+) {
+    let mut container_manager = container_manager.lock().await;
+    if !container_manager.claimed {
+        container_manager.claimed = true;
+        start_container(&mut container_manager).await;
+    }
+
+    let pool = single_connection_pool(container_manager.port).await;
+    let before = backend_pid(&pool).await;
+
+    let abandoned = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        get_stream(
+            Arc::clone(&pool) as Arc<DynPostgresConnectionPool>,
+            "SELECT true AS slept FROM pg_sleep(60) AS before_its_first_row".to_string(),
+            Arc::new(Schema::new(vec![Field::new(
+                "slept",
+                DataType::Boolean,
+                true,
+            )])),
+        ),
+    )
+    .await;
+    assert!(abandoned.is_err(), "the query has no row to return yet");
+
+    let admin = common::get_postgres_connection_pool(container_manager.port)
+        .await
+        .expect("Postgres connection pool should be created")
+        .connect_direct()
+        .await
+        .expect("Connection should be established");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let running: i64 = admin
+            .conn
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE state = 'active' AND query LIKE '%before_its_first_row%' \
+                 AND pid <> pg_backend_pid()",
+                &[],
+            )
+            .await
+            .expect("pg_stat_activity should be readable")
+            .get(0);
+        if running == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the abandoned query is still running"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    assert_ne!(
+        backend_pid(&pool).await,
+        before,
+        "the connection the cancel was sent on is not reused"
+    );
 }
