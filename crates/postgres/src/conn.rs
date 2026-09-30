@@ -386,20 +386,32 @@ fn format_postgres_query_error(source: &bb8_postgres::tokio_postgres::Error) -> 
 /// How long a request to cancel a query may take before it is abandoned.
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// A query's rows that, dropped before they end, have the server stop producing them rather
-/// than run the query to completion, or its timeout, for no one.
-struct CancelOnDrop<S, F: FnOnce()> {
-    rows: S,
-    cancel: Option<F>,
+/// A request to cancel a query, sent when dropped unless disarmed first: the server stops
+/// working on a query no one waits for, rather than run it to completion, or its timeout.
+struct Cancel<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Cancel<F> {
+    fn new(cancel: F) -> Self {
+        Self(Some(cancel))
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
 }
 
-impl<S, F: FnOnce()> CancelOnDrop<S, F> {
-    fn new(rows: S, cancel: F) -> Self {
-        Self {
-            rows,
-            cancel: Some(cancel),
+impl<F: FnOnce()> Drop for Cancel<F> {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.0.take() {
+            cancel();
         }
     }
+}
+
+/// A query's rows, whose query is cancelled if they are dropped before they end.
+struct CancelOnDrop<S, F: FnOnce()> {
+    rows: S,
+    cancel: Cancel<F>,
 }
 
 impl<S, T, E, F> Stream for CancelOnDrop<S, F>
@@ -413,17 +425,9 @@ where
         let polled = self.rows.poll_next_unpin(cx);
         // After its end or an error, the statement is no longer running.
         if matches!(polled, Poll::Ready(None | Some(Err(_)))) {
-            self.cancel = None;
+            self.cancel.disarm();
         }
         polled
-    }
-}
-
-impl<S, F: FnOnce()> Drop for CancelOnDrop<S, F> {
-    fn drop(&mut self) {
-        if let Some(cancel) = self.cancel.take() {
-            cancel();
-        }
     }
 }
 
@@ -642,13 +646,20 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
     ) -> Result<SendableRecordBatchStream> {
         // TODO: We should have a way to detect if params have been passed
         // if they haven't we should use .copy_out instead, because it should be much faster
-        let cancel = self.canceller();
+        // Armed before the query is sent: the server holds back even the reply to the query
+        // starting until its first rows are ready or it ends, so the wait can be long.
+        let mut cancel = Cancel::new(self.canceller());
         let streamable = self
             .conn
             .query_raw(sql, params.iter().copied()) // use .query_raw to get access to the underlying RowStream
-            .await
-            .context(QuerySnafu)?;
-        let streamable = CancelOnDrop::new(Box::pin(streamable), cancel);
+            .await;
+        if streamable.is_err() {
+            cancel.disarm();
+        }
+        let streamable = CancelOnDrop {
+            rows: Box::pin(streamable.context(QuerySnafu)?),
+            cancel,
+        };
 
         // chunk the stream into groups of rows
         let mut stream = streamable.chunks(4_000).boxed().map(move |rows| {
@@ -1038,7 +1049,7 @@ impl PostgresConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::CancelOnDrop;
+    use super::{Cancel, CancelOnDrop};
     use futures::{stream, StreamExt};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -1048,10 +1059,26 @@ mod tests {
     fn rows(items: Vec<Result<u8, ()>>) -> (CancelOnDrop<Rows, impl FnOnce()>, Arc<AtomicBool>) {
         let cancelled = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&cancelled);
-        let rows = CancelOnDrop::new(stream::iter(items), move || {
-            flag.store(true, Ordering::SeqCst)
-        });
+        let rows = CancelOnDrop {
+            rows: stream::iter(items),
+            cancel: Cancel::new(move || flag.store(true, Ordering::SeqCst)),
+        };
         (rows, cancelled)
+    }
+
+    #[test]
+    fn a_query_waited_on_is_cancelled_unless_it_failed() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancelled);
+        drop(Cancel::new(move || flag.store(true, Ordering::SeqCst)));
+        assert!(cancelled.load(Ordering::SeqCst));
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancelled);
+        let mut failed = Cancel::new(move || flag.store(true, Ordering::SeqCst));
+        failed.disarm();
+        drop(failed);
+        assert!(!cancelled.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
