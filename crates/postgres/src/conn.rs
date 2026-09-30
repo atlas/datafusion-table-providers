@@ -689,7 +689,7 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
                         yield Ok(batch); // we can yield the batch as-is because we've already converted to Arrow in the chunk map
                     }
                     Err(e) => {
-                        yield Err(DataFusionError::Execution(format!("Failed to fetch batch: {e}")));
+                        yield Err(DataFusionError::External(Box::new(e)));
                     }
                 }
            }
