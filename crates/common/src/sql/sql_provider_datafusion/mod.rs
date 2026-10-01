@@ -696,11 +696,12 @@ pub async fn get_stream<T: 'static, P: 'static>(
     sql: String,
     projected_schema: SchemaRef,
 ) -> DataFusionResult<SendableRecordBatchStream> {
-    let conn = pool.connect().await.map_err(to_execution_error)?;
+    // External, not formatted: a caller can still read the database's own error.
+    let conn = pool.connect().await.map_err(DataFusionError::External)?;
 
     query_arrow(conn, sql, Some(projected_schema))
         .await
-        .map_err(to_execution_error)
+        .map_err(|e| DataFusionError::External(Box::new(e)))
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -1458,6 +1459,59 @@ mod tests {
             let table = new_sql_table().with_constraints(constraints.clone());
 
             assert_eq!(table.constraints(), Some(&constraints));
+        }
+    }
+
+    mod stream_error_tests {
+        use std::sync::Arc;
+
+        use datafusion::arrow::datatypes::Schema;
+
+        use crate::sql::db_connection_pool::{
+            dbconnection::DbConnection, DbConnectionPool, JoinPushDown,
+        };
+        use crate::sql::sql_provider_datafusion::get_stream;
+
+        #[derive(Debug)]
+        struct Refused;
+
+        impl std::fmt::Display for Refused {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("refused")
+            }
+        }
+
+        impl std::error::Error for Refused {}
+
+        struct RefusingPool;
+
+        #[async_trait::async_trait]
+        impl DbConnectionPool<(), &'static dyn ToString> for RefusingPool {
+            async fn connect(
+                &self,
+            ) -> Result<
+                Box<dyn DbConnection<(), &'static dyn ToString>>,
+                Box<dyn std::error::Error + Send + Sync>,
+            > {
+                Err(Box::new(Refused))
+            }
+
+            fn join_push_down(&self) -> JoinPushDown {
+                JoinPushDown::Disallow
+            }
+        }
+
+        #[tokio::test]
+        async fn test_a_stream_error_keeps_its_source() {
+            let pool = Arc::new(RefusingPool)
+                as Arc<dyn DbConnectionPool<(), &'static dyn ToString> + Send + Sync>;
+            let Err(error) =
+                get_stream(pool, "SELECT 1".to_string(), Arc::new(Schema::empty())).await
+            else {
+                panic!("the pool refuses every connection");
+            };
+            let source = std::error::Error::source(&error).expect("the error has a source");
+            assert!(source.downcast_ref::<Refused>().is_some(), "{error}");
         }
     }
 }
