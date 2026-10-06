@@ -80,10 +80,10 @@ pub(crate) fn pg_data_type_to_arrow_type(
         "date" => Ok(DataType::Date32),
         "time" | "time without time zone" => Ok(DataType::Time64(TimeUnit::Nanosecond)),
         "timestamp" | "timestamp without time zone" => {
-            Ok(DataType::Timestamp(TimeUnit::Nanosecond, None))
+            Ok(DataType::Timestamp(TimeUnit::Microsecond, None))
         }
         "timestamp with time zone" | "timestamptz" => Ok(DataType::Timestamp(
-            TimeUnit::Nanosecond,
+            TimeUnit::Microsecond,
             Some("UTC".into()),
         )),
         "interval" => Ok(DataType::Interval(IntervalUnit::MonthDayNano)),
@@ -370,12 +370,12 @@ mod tests {
         assert_eq!(
             pg_data_type_to_arrow_type("timestamp without time zone", &context, None)
                 .expect("Failed to convert timestamp without time zone"),
-            DataType::Timestamp(TimeUnit::Nanosecond, None)
+            DataType::Timestamp(TimeUnit::Microsecond, None)
         );
         assert_eq!(
             pg_data_type_to_arrow_type("timestamp with time zone", &context, None)
                 .expect("Failed to convert timestamp with time zone"),
-            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
         );
         assert_eq!(
             pg_data_type_to_arrow_type("interval", &context, None)
@@ -808,7 +808,7 @@ mod tests {
         assert_eq!(redshift("date").expect("date"), DataType::Date32);
         assert_eq!(
             redshift("timestamp").expect("timestamp"),
-            DataType::Timestamp(TimeUnit::Nanosecond, None)
+            DataType::Timestamp(TimeUnit::Microsecond, None)
         );
     }
 
@@ -870,7 +870,7 @@ mod tests {
         );
         assert_eq!(
             redshift("timestamp without time zone").expect("timestamp without time zone"),
-            DataType::Timestamp(TimeUnit::Nanosecond, None)
+            DataType::Timestamp(TimeUnit::Microsecond, None)
         );
     }
 

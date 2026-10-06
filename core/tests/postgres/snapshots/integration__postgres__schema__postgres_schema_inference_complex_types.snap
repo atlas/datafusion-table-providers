@@ -126,7 +126,7 @@ Schema {
         Field {
             name: "timestamp_col",
             data_type: Timestamp(
-                Nanosecond,
+                Microsecond,
                 None,
             ),
             nullable: true,
@@ -137,7 +137,7 @@ Schema {
         Field {
             name: "timestamptz_col",
             data_type: Timestamp(
-                Nanosecond,
+                Microsecond,
                 Some(
                     "UTC",
                 ),
