@@ -24,7 +24,7 @@ use super::{
 use arrow::array::{
     ArrayBuilder, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
     Float64Builder, Int16Builder, Int32Builder, Int64Builder, ListBuilder, StringBuilder,
-    StringDictionaryBuilder, StructBuilder, Time64NanosecondBuilder, TimestampNanosecondBuilder,
+    StringDictionaryBuilder, StructBuilder, Time64NanosecondBuilder, TimestampMicrosecondBuilder,
     UInt32Builder,
 };
 use arrow::datatypes::{DataType, Date32Type, Field, Fields, Int8Type, TimeUnit};
@@ -103,8 +103,8 @@ pub(crate) fn data_type_with(
         Type::BYTEA => DataType::Binary,
         Type::DATE => DataType::Date32,
         Type::TIME => DataType::Time64(TimeUnit::Nanosecond),
-        Type::TIMESTAMP => DataType::Timestamp(TimeUnit::Nanosecond, None),
-        Type::TIMESTAMPTZ => DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
+        Type::TIMESTAMP => DataType::Timestamp(TimeUnit::Microsecond, None),
+        Type::TIMESTAMPTZ => DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))),
         Type::NUMERIC => numeric_type(modifier),
         _ if is_geometry(ty) => DataType::Binary,
         _ => match ty.kind() {
@@ -284,14 +284,12 @@ fn append_scalar(
             v.num_seconds_from_midnight()
         ) * 1_000_000_000
             + i64::from(v.nanosecond())),
-        Type::TIMESTAMP => put!(TimestampNanosecondBuilder, NaiveDateTime, |v| nanos(
-            v.and_utc(),
-            ty,
-            field_name
-        )?),
-        Type::TIMESTAMPTZ => put!(TimestampNanosecondBuilder, DateTime<Utc>, |v| nanos(
-            v, ty, field_name
-        )?),
+        // PostgreSQL keeps microseconds, so every value it holds fits.
+        Type::TIMESTAMP => put!(TimestampMicrosecondBuilder, NaiveDateTime, |v| v
+            .and_utc()
+            .timestamp_micros()),
+        Type::TIMESTAMPTZ => put!(TimestampMicrosecondBuilder, DateTime<Utc>, |v| v
+            .timestamp_micros()),
         Type::NUMERIC => {
             let DataType::Decimal128(_, scale) = data_type else {
                 return mismatch(ty, data_type, field_name);
@@ -354,7 +352,7 @@ fn append_null(builder: &mut dyn ArrayBuilder, ty: &Type, field_name: &str) -> R
         BinaryBuilder,
         Date32Builder,
         Time64NanosecondBuilder,
-        TimestampNanosecondBuilder,
+        TimestampMicrosecondBuilder,
         Decimal128Builder,
         StringDictionaryBuilder<Int8Type>
     );
@@ -384,16 +382,6 @@ fn mismatch<T>(ty: &Type, data_type: &DataType, field_name: &str) -> Result<T> {
         field_name,
         format!("cannot decode it as {data_type}").into(),
     ))
-}
-
-fn nanos(value: DateTime<Utc>, ty: &Type, field_name: &str) -> Result<i64> {
-    value.timestamp_nanos_opt().ok_or_else(|| {
-        decode_error(
-            ty,
-            field_name,
-            "out of range for a nanosecond timestamp".into(),
-        )
-    })
 }
 
 fn is_geometry(ty: &Type) -> bool {

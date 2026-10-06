@@ -7,7 +7,7 @@ use arrow::array::{
     Decimal128Builder, FixedSizeListBuilder, Float32Builder, Float64Builder, Int16Builder,
     Int32Builder, Int64Builder, Int8Builder, IntervalMonthDayNanoBuilder, ListBuilder, RecordBatch,
     RecordBatchOptions, StringArray, StringBuilder, StringDictionaryBuilder,
-    Time64NanosecondBuilder, TimestampNanosecondBuilder, UInt32Builder,
+    Time64NanosecondBuilder, TimestampMicrosecondBuilder, UInt32Builder,
 };
 use arrow::datatypes::{
     DataType, Date32Type, Field, Int8Type, IntervalMonthDayNanoType, IntervalUnit, Schema,
@@ -24,7 +24,6 @@ use geo_types::geometry::Point;
 use rust_decimal::Decimal;
 use sea_query::{Alias, ColumnType, SeaRc};
 use snafu::prelude::*;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_postgres::types::FromSql;
 use tokio_postgres::types::Kind;
 use tokio_postgres::{types::Type, Row};
@@ -714,29 +713,22 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                     };
                     let Some(builder) = builder
                         .as_any_mut()
-                        .downcast_mut::<TimestampNanosecondBuilder>()
+                        .downcast_mut::<TimestampMicrosecondBuilder>()
                     else {
                         return FailedToDowncastBuilderSnafu {
                             postgres_type: format!("{postgres_type}"),
                         }
                         .fail();
                     };
-                    let v = get::<Option<SystemTime>>(row, i).with_context(|_| {
+                    let v = get::<Option<chrono::NaiveDateTime>>(row, i).with_context(|_| {
                         FailedToGetRowValueSnafu {
                             pg_type: Type::TIMESTAMP,
                         }
                     })?;
 
+                    // PostgreSQL keeps microseconds, so every value it holds fits.
                     match v {
-                        Some(v) => {
-                            if let Ok(v) = v.duration_since(UNIX_EPOCH) {
-                                let timestamp: i64 = v
-                                    .as_nanos()
-                                    .try_into()
-                                    .context(FailedToConvertU128toI64Snafu)?;
-                                builder.append_value(timestamp);
-                            }
-                        }
+                        Some(v) => builder.append_value(v.and_utc().timestamp_micros()),
                         None => builder.append_null(),
                     }
                 }
@@ -748,12 +740,12 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                     })?;
 
                     let timestamptz_builder = builder.get_or_insert_with(|| {
-                        Box::new(TimestampNanosecondBuilder::new().with_timezone("UTC"))
+                        Box::new(TimestampMicrosecondBuilder::new().with_timezone("UTC"))
                     });
 
                     let Some(timestamptz_builder) = timestamptz_builder
                         .as_any_mut()
-                        .downcast_mut::<TimestampNanosecondBuilder>()
+                        .downcast_mut::<TimestampMicrosecondBuilder>()
                     else {
                         return FailedToDowncastBuilderSnafu {
                             postgres_type: format!("{postgres_type}"),
@@ -767,7 +759,7 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                         };
                         let new_arrow_field = Field::new(
                             field_name,
-                            DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
+                            DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))),
                             true,
                         );
 
@@ -775,11 +767,7 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                     }
 
                     match v {
-                        Some(v) => {
-                            let utc_timestamp =
-                                v.to_utc().timestamp_nanos_opt().unwrap_or_default();
-                            timestamptz_builder.append_value(utc_timestamp);
-                        }
+                        Some(v) => timestamptz_builder.append_value(v.timestamp_micros()),
                         None => timestamptz_builder.append_null(),
                     }
                 }
@@ -1181,11 +1169,10 @@ fn map_column_type_to_data_type(column_type: &Type, field_name: &str) -> Result<
         // Inspect the scale from the first row. Precision will always be 38 for Decimal128.
         Type::NUMERIC_ARRAY => Ok(None),
         Type::TIMESTAMPTZ => Ok(Some(DataType::Timestamp(
-            TimeUnit::Nanosecond,
+            TimeUnit::Microsecond,
             Some(Arc::from("UTC")),
         ))),
-        // We get a SystemTime that we can always convert into milliseconds
-        Type::TIMESTAMP => Ok(Some(DataType::Timestamp(TimeUnit::Nanosecond, None))),
+        Type::TIMESTAMP => Ok(Some(DataType::Timestamp(TimeUnit::Microsecond, None))),
         Type::DATE => Ok(Some(DataType::Date32)),
         Type::TIME => Ok(Some(DataType::Time64(TimeUnit::Nanosecond))),
         Type::INTERVAL => Ok(Some(DataType::Interval(IntervalUnit::MonthDayNano))),

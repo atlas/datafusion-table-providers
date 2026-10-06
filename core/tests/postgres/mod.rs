@@ -206,6 +206,7 @@ async fn test_arrow_postgres_one_way(container_manager: &Mutex<ContainerManager>
     test_postgres_nested_composites(container_manager.port).await;
     test_postgres_sort_limit(container_manager.port).await;
     test_postgres_unconstrained_numeric_precision(container_manager.port).await;
+    test_postgres_timestamps_in_microseconds(container_manager.port).await;
 }
 
 /// A domain is read as the type it is over, wherever it appears: a column, a domain of a
@@ -419,7 +420,7 @@ async fn test_postgres_nested_composites(port: usize) {
 
     let list = |item: DataType| DataType::List(Arc::new(Field::new("item", item, true)));
     let utc = DataType::Timestamp(
-        datafusion::arrow::datatypes::TimeUnit::Nanosecond,
+        datafusion::arrow::datatypes::TimeUnit::Microsecond,
         Some("UTC".into()),
     );
     let record = DataType::Struct(
@@ -560,6 +561,87 @@ async fn test_postgres_nested_composites(port: usize) {
         .batch_execute("DROP SCHEMA nested CASCADE;")
         .await
         .expect("Nested fixtures should be dropped");
+}
+
+/// Timestamps read as microseconds, PostgreSQL's own precision, so every value it holds
+/// keeps its instant: before 1970, before 1677 and after 2262, where nanoseconds since
+/// 1970 overflow, at the top level and in a composite alike.
+async fn test_postgres_timestamps_in_microseconds(port: usize) {
+    let pool = common::get_postgres_connection_pool(port)
+        .await
+        .expect("Postgres connection pool should be created");
+    let db_conn = pool
+        .connect_direct()
+        .await
+        .expect("Connection should be established");
+    db_conn
+        .conn
+        .batch_execute(
+            "DROP SCHEMA IF EXISTS times CASCADE;
+            CREATE SCHEMA times;
+            CREATE TYPE times.stamped AS (at timestamptz);
+            CREATE TABLE times.values (id int, local timestamp, utc timestamptz, inner_at times.stamped);
+            INSERT INTO times.values VALUES
+                (1, '1969-12-31 23:59:59.5', '1969-12-31 23:59:59.5+00', ROW('1969-12-31 23:59:59.5+00')),
+                (2, '1500-01-01 00:00:00', '1500-01-01 00:00:00+00', ROW('1500-01-01 00:00:00+00')),
+                (3, '3000-01-01 00:00:00.000001', '3000-01-01 00:00:00.000001+00', ROW('3000-01-01 00:00:00.000001+00')),
+                (4, NULL, NULL, ROW(NULL));",
+        )
+        .await
+        .expect("Timestamp fixtures should be created");
+
+    let sqltable_pool: Arc<DynPostgresConnectionPool> = Arc::new(pool);
+    let table = SqlTable::new("postgres", &sqltable_pool, "times.values")
+        .await
+        .expect("SqlTable should infer the timestamps' schema");
+    let micros = |zone: Option<&str>| {
+        DataType::Timestamp(
+            datafusion::arrow::datatypes::TimeUnit::Microsecond,
+            zone.map(Into::into),
+        )
+    };
+    let ctx = SessionContext::new();
+    ctx.register_table("stamps", Arc::new(table))
+        .expect("Table should be registered");
+    let batches = ctx
+        .sql("SELECT * FROM stamps ORDER BY id")
+        .await
+        .expect("DataFrame should be created from query")
+        .collect()
+        .await
+        .expect("Timestamps should decode");
+    let schema = batches[0].schema();
+    assert_eq!(schema.field(1).data_type(), &micros(None));
+    assert_eq!(schema.field(2).data_type(), &micros(Some("UTC")));
+    assert_eq!(
+        schema.field(3).data_type(),
+        &DataType::Struct(vec![Field::new("at", micros(Some("UTC")), true)].into())
+    );
+    let printed = datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+        .unwrap()
+        .to_string();
+    let rows: Vec<String> = printed
+        .lines()
+        .filter(|line| line.starts_with('|'))
+        .skip(1)
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            "| 1 | 1969-12-31T23:59:59.500 | 1969-12-31T23:59:59.500Z | {at: 1969-12-31T23:59:59.500Z} |",
+            "| 2 | 1500-01-01T00:00:00 | 1500-01-01T00:00:00Z | {at: 1500-01-01T00:00:00Z} |",
+            "| 3 | 3000-01-01T00:00:00.000001 | 3000-01-01T00:00:00.000001Z | {at: 3000-01-01T00:00:00.000001Z} |",
+            "| 4 | | | {at: } |",
+        ],
+        "{printed}"
+    );
+
+    db_conn
+        .conn
+        .batch_execute("DROP SCHEMA times CASCADE;")
+        .await
+        .expect("Timestamp fixtures should be dropped");
 }
 
 /// An unconstrained `numeric` column (what `max()`, `avg()` and arithmetic over `numeric`
