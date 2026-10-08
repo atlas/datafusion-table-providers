@@ -2832,6 +2832,7 @@ dependencies = [
  "bb8-postgres",
  "bigdecimal",
  "byteorder",
+ "bytes",
  "chrono",
  "datafusion",
  "datafusion-federation",

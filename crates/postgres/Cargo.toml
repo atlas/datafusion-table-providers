@@ -17,6 +17,7 @@ bb8 = "0.9"
 bb8-postgres = "0.9"
 bigdecimal = "0.4"
 byteorder = "1.5"
+bytes = "1"
 chrono = "0.4.44"
 datafusion = { workspace = true, default-features = false, features = ["sql"] }
 datafusion-federation = { workspace = true, features = ["sql"], optional = true }
