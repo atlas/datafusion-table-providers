@@ -19,6 +19,13 @@ pub const DESCRIPTION_METADATA_KEY: &str = "description";
 /// pushdown).
 pub const SOURCE_TYPE_METADATA_KEY: &str = "source_type";
 
+/// Arrow field metadata key holding, for a column whose type is a domain, the type the
+/// domain is ultimately over, as the source database formats it (e.g.
+/// `geometry(Point,4326)` for a domain over that). A domain's values are its base type's,
+/// so this is what a consumer that recognises types by name should look at; the source
+/// type still names the domain. Absent for a column whose type is not a domain.
+pub const SOURCE_BASE_TYPE_METADATA_KEY: &str = "source_base_type";
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("The database file path is not within the current directory: {path}"))]

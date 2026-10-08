@@ -27,7 +27,7 @@ fn get_schema() -> SchemaRef {
         Field::new("is_active", DataType::Boolean, true),
         Field::new(
             "created_at",
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            DataType::Timestamp(TimeUnit::Microsecond, None),
             true,
         ),
         Field::new("data", DataType::Binary, true),

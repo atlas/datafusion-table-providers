@@ -19,7 +19,9 @@ use datafusion_federation::schema_cast::record_convert::try_cast_to;
 
 use datafusion_table_providers::{
     postgres::{DynPostgresConnectionPool, PostgresTableProviderFactory},
-    sql::sql_provider_datafusion::SqlTable,
+    sql::db_connection_pool::postgrespool::PostgresConnectionPool,
+    sql::sql_provider_datafusion::{get_stream, SqlTable},
+    util::secrets::to_secret_map,
     UnsupportedTypeAction,
 };
 use rstest::{fixture, rstest};
@@ -29,7 +31,10 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, MutexGuard};
 
 mod common;
+mod copy;
 mod schema;
+#[cfg(any(feature = "postgres-native-tls", feature = "postgres-rustls"))]
+mod tls;
 
 async fn arrow_postgres_round_trip(
     port: usize,
@@ -183,6 +188,20 @@ async fn test_arrow_postgres_roundtrip(
 
 #[rstest]
 #[test_log::test(tokio::test)]
+async fn test_postgres_copy_writes(container_manager: &Mutex<ContainerManager>) {
+    let mut container_manager = container_manager.lock().await;
+    if !container_manager.claimed {
+        container_manager.claimed = true;
+        start_container(&mut container_manager).await;
+    }
+
+    copy::test_postgres_copy_writes_composites_arrays_and_jsonb(container_manager.port).await;
+    copy::test_postgres_copy_resolves_conflicts(container_manager.port).await;
+    copy::test_postgres_copy_falls_back_to_insert(container_manager.port).await;
+}
+
+#[rstest]
+#[test_log::test(tokio::test)]
 async fn test_arrow_postgres_one_way(container_manager: &Mutex<ContainerManager>) {
     let mut container_manager = container_manager.lock().await;
     if !container_manager.claimed {
@@ -198,8 +217,446 @@ async fn test_arrow_postgres_one_way(container_manager: &Mutex<ContainerManager>
     test_postgres_jsonb_list_struct_with_projected_schema(container_manager.port).await;
     test_postgres_json_list_struct_with_projected_schema(container_manager.port).await;
     test_postgres_composite_array_list_struct(container_manager.port).await;
+    test_postgres_domain_types(container_manager.port).await;
+    test_postgres_nested_composites(container_manager.port).await;
     test_postgres_sort_limit(container_manager.port).await;
     test_postgres_unconstrained_numeric_precision(container_manager.port).await;
+    test_postgres_timestamps_in_microseconds(container_manager.port).await;
+}
+
+/// A domain is read as the type it is over, wherever it appears: a column, a domain of a
+/// domain, a composite's attribute, an array's element, and a domain over a composite held
+/// in an array — the shape a list of structs takes when each element carries a check.
+async fn test_postgres_domain_types(port: usize) {
+    let pool = common::get_postgres_connection_pool(port)
+        .await
+        .expect("Postgres connection pool should be created");
+    let db_conn = pool
+        .connect_direct()
+        .await
+        .expect("Connection should be established");
+
+    db_conn
+        .conn
+        .batch_execute(
+            "DROP SCHEMA IF EXISTS domains CASCADE;
+            CREATE SCHEMA domains;
+            CREATE DOMAIN domains.positive AS integer CHECK (VALUE > 0);
+            CREATE DOMAIN domains.small AS domains.positive CHECK (VALUE < 100);
+            CREATE DOMAIN domains.code AS varchar(8);
+            CREATE DOMAIN domains.price AS numeric(10,2);
+            CREATE TYPE domains.line_item AS (sku domains.code, qty domains.positive);
+            CREATE DOMAIN domains.checked_item AS domains.line_item
+                CHECK (VALUE IS NULL OR (VALUE).qty IS NOT NULL);
+            CREATE TABLE domains.orders (
+                id domains.small PRIMARY KEY,
+                code domains.code,
+                price domains.price,
+                item domains.checked_item,
+                items domains.checked_item[],
+                counts domains.positive[]
+            );
+            INSERT INTO domains.orders VALUES
+                (1, 'A1', 9.99, ROW('a', 2),
+                 ARRAY[ROW('a', 2), ROW('b', 1)]::domains.checked_item[], ARRAY[1, 2]),
+                (2, NULL, NULL, NULL, ARRAY[]::domains.checked_item[], NULL);",
+        )
+        .await
+        .expect("Domain fixtures should be created");
+
+    let sqltable_pool: Arc<DynPostgresConnectionPool> = Arc::new(pool);
+    let table = SqlTable::new("postgres", &sqltable_pool, "domains.orders")
+        .await
+        .expect("SqlTable should infer a schema through domains");
+
+    let item = DataType::Struct(
+        vec![
+            Field::new("sku", DataType::Utf8, true),
+            Field::new("qty", DataType::Int32, true),
+        ]
+        .into(),
+    );
+    let inferred: Vec<(String, DataType)> = table
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| (f.name().clone(), f.data_type().clone()))
+        .collect();
+    let expected = vec![
+        ("id".to_string(), DataType::Int32),
+        ("code".to_string(), DataType::Utf8),
+        ("price".to_string(), DataType::Decimal128(10, 2)),
+        ("item".to_string(), item.clone()),
+        (
+            "items".to_string(),
+            DataType::List(Arc::new(Field::new("item", item, true))),
+        ),
+        (
+            "counts".to_string(),
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+        ),
+    ];
+    assert_eq!(inferred, expected, "each domain infers as its base type");
+
+    let source_type = |name: &str| {
+        table
+            .schema()
+            .field_with_name(name)
+            .unwrap()
+            .metadata()
+            .get(datafusion_table_providers::SOURCE_TYPE_METADATA_KEY)
+            .cloned()
+    };
+    assert_eq!(
+        source_type("price").as_deref(),
+        Some("domains.price"),
+        "the source type still names the domain"
+    );
+
+    let base_type = |name: &str| {
+        table
+            .schema()
+            .field_with_name(name)
+            .unwrap()
+            .metadata()
+            .get(datafusion_table_providers::SOURCE_BASE_TYPE_METADATA_KEY)
+            .cloned()
+    };
+    assert_eq!(base_type("price").as_deref(), Some("numeric(10,2)"));
+    assert_eq!(
+        base_type("id").as_deref(),
+        Some("integer"),
+        "a domain of a domain is over the innermost base"
+    );
+    assert_eq!(base_type("code").as_deref(), Some("character varying(8)"));
+    assert_eq!(
+        base_type("items"),
+        None,
+        "an array of domains is an array, not a domain"
+    );
+
+    let ctx = SessionContext::new();
+    ctx.register_table("orders", Arc::new(table))
+        .expect("Table should be registered");
+    let batches = ctx
+        .sql("SELECT * FROM orders ORDER BY id")
+        .await
+        .expect("DataFrame should be created from query")
+        .collect()
+        .await
+        .expect("Rows of domain columns should decode");
+
+    let printed = datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+        .unwrap()
+        .to_string();
+    let expected = "\
++----+------+-------+----------------+------------------------------------------+--------+
+| id | code | price | item           | items                                    | counts |
++----+------+-------+----------------+------------------------------------------+--------+
+| 1  | A1   | 9.99  | {sku: a, qty: 2} | [{sku: a, qty: 2}, {sku: b, qty: 1}]   | [1, 2] |
+| 2  |      |       |                |  []                                      |        |
++----+------+-------+----------------+------------------------------------------+--------+";
+    // Compared cell by cell rather than as a table, so column widths don't matter.
+    let cells = |table: &str| -> Vec<Vec<String>> {
+        table
+            .lines()
+            .filter(|line| line.starts_with('|'))
+            .map(|line| line.split('|').map(|c| c.trim().to_string()).collect())
+            .collect()
+    };
+    assert_eq!(cells(&printed), cells(expected), "{printed}");
+
+    db_conn
+        .conn
+        .batch_execute("DROP SCHEMA domains CASCADE;")
+        .await
+        .expect("Domain fixtures should be dropped");
+}
+
+/// Composites nest to any depth, and arrays of anything but the common scalars decode
+/// too: a struct holding a struct and a list of structs, each through a domain, with members
+/// of most scalar types, and nulls at every level. The layout is the one a table of
+/// checked, nested records takes.
+async fn test_postgres_nested_composites(port: usize) {
+    let pool = common::get_postgres_connection_pool(port)
+        .await
+        .expect("Postgres connection pool should be created");
+    let db_conn = pool
+        .connect_direct()
+        .await
+        .expect("Connection should be established");
+
+    db_conn
+        .conn
+        .batch_execute(
+            "DROP SCHEMA IF EXISTS nested CASCADE;
+            CREATE SCHEMA nested;
+            CREATE TYPE nested.owner AS (name text, since timestamptz);
+            CREATE DOMAIN nested.checked_owner AS nested.owner
+                CHECK (VALUE IS NOT DISTINCT FROM NULL OR (VALUE).name IS NOT NULL);
+            CREATE TYPE nested.tag AS (code text, n bigint);
+            CREATE DOMAIN nested.checked_tag AS nested.tag;
+            CREATE TYPE nested.record AS (
+                id uuid, flag boolean, count bigint, ratio double precision, day date,
+                doc jsonb, amount numeric(10,2),
+                owner nested.checked_owner, tags nested.checked_tag[]
+            );
+            CREATE DOMAIN nested.element AS nested.record CHECK (VALUE IS DISTINCT FROM NULL);
+            CREATE TABLE nested.records (
+                id int PRIMARY KEY,
+                one nested.record,
+                many nested.element[],
+                texts varchar(10)[],
+                times timestamptz[]
+            );
+            INSERT INTO nested.records VALUES
+                (1,
+                 ROW('00000000-0000-0000-0000-000000000001', true, 7, 0.5, '2026-09-28',
+                     '{\"a\": 1}', 12.34,
+                     ROW('ann', '2026-09-28 12:00:00+00')::nested.owner,
+                     ARRAY[ROW('x', 1)::nested.tag, ROW('y', NULL)::nested.tag])::nested.record,
+                 ARRAY[
+                     ROW('00000000-0000-0000-0000-000000000002', false, NULL, NULL, NULL, NULL,
+                         NULL, NULL, ARRAY[]::nested.checked_tag[])::nested.record
+                 ]::nested.element[],
+                 ARRAY['a', NULL]::varchar(10)[],
+                 ARRAY['2026-09-28 12:00:00+00'::timestamptz]),
+                (2, NULL, ARRAY[]::nested.element[], NULL, NULL),
+                (3, ROW(NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)::nested.record,
+                 NULL, ARRAY[]::varchar(10)[], NULL);",
+        )
+        .await
+        .expect("Nested fixtures should be created");
+
+    let sqltable_pool: Arc<DynPostgresConnectionPool> = Arc::new(pool);
+    let table = SqlTable::new("postgres", &sqltable_pool, "nested.records")
+        .await
+        .expect("SqlTable should infer a schema through nested composites");
+
+    let list = |item: DataType| DataType::List(Arc::new(Field::new("item", item, true)));
+    let utc = DataType::Timestamp(
+        datafusion::arrow::datatypes::TimeUnit::Microsecond,
+        Some("UTC".into()),
+    );
+    let record = DataType::Struct(
+        vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("flag", DataType::Boolean, true),
+            Field::new("count", DataType::Int64, true),
+            Field::new("ratio", DataType::Float64, true),
+            Field::new("day", DataType::Date32, true),
+            Field::new("doc", DataType::Utf8, true),
+            Field::new("amount", DataType::Decimal128(10, 2), true),
+            Field::new(
+                "owner",
+                DataType::Struct(
+                    vec![
+                        Field::new("name", DataType::Utf8, true),
+                        Field::new("since", utc.clone(), true),
+                    ]
+                    .into(),
+                ),
+                true,
+            ),
+            Field::new(
+                "tags",
+                list(DataType::Struct(
+                    vec![
+                        Field::new("code", DataType::Utf8, true),
+                        Field::new("n", DataType::Int64, true),
+                    ]
+                    .into(),
+                )),
+                true,
+            ),
+        ]
+        .into(),
+    );
+    let types = |schema: SchemaRef| -> Vec<(String, DataType)> {
+        schema
+            .fields()
+            .iter()
+            .map(|f| (f.name().clone(), f.data_type().clone()))
+            .collect()
+    };
+    let expected = vec![
+        ("id".to_string(), DataType::Int32),
+        ("one".to_string(), record.clone()),
+        ("many".to_string(), list(record)),
+        ("texts".to_string(), list(DataType::Utf8)),
+        ("times".to_string(), list(utc)),
+    ];
+    assert_eq!(
+        types(table.schema()),
+        expected,
+        "nested types infer in full"
+    );
+
+    let ctx = SessionContext::new();
+    ctx.register_table("records", Arc::new(table))
+        .expect("Table should be registered");
+    let batches = ctx
+        .sql("SELECT * FROM records ORDER BY id")
+        .await
+        .expect("DataFrame should be created from query")
+        .collect()
+        .await
+        .expect("Rows of nested composites should decode");
+    assert_eq!(
+        types(batches[0].schema()),
+        expected,
+        "rows decode into exactly the inferred types"
+    );
+
+    let printed = datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+        .unwrap()
+        .to_string();
+    let cells: Vec<Vec<String>> = printed
+        .lines()
+        .filter(|line| line.starts_with('|'))
+        .skip(1)
+        .map(|line| {
+            line.trim_matches('|')
+                .split(" | ")
+                .map(|c| c.trim().to_string())
+                .collect()
+        })
+        .collect();
+    println!("{printed}");
+    assert_eq!(
+        cells,
+        vec![
+            vec![
+                "1".to_string(),
+                "{id: 00000000-0000-0000-0000-000000000001, flag: true, count: 7, ratio: 0.5, \
+                 day: 2026-09-28, doc: {\"a\": 1}, amount: 12.34, \
+                 owner: {name: ann, since: 2026-09-28T12:00:00Z}, \
+                 tags: [{code: x, n: 1}, {code: y, n: }]}"
+                    .to_string(),
+                "[{id: 00000000-0000-0000-0000-000000000002, flag: false, count: , ratio: , \
+                 day: , doc: , amount: , owner: , tags: []}]"
+                    .to_string(),
+                "[a, ]".to_string(),
+                "[2026-09-28T12:00:00Z]".to_string(),
+            ],
+            vec![
+                "2".to_string(),
+                String::new(),
+                "[]".to_string(),
+                String::new(),
+                String::new(),
+            ],
+            vec![
+                "3".to_string(),
+                "{id: , flag: , count: , ratio: , day: , doc: , amount: , owner: , tags: }"
+                    .to_string(),
+                String::new(),
+                "[]".to_string(),
+                String::new(),
+            ],
+        ],
+    );
+
+    // A member of a type nothing decodes fails the table, and does not panic.
+    db_conn
+        .conn
+        .batch_execute(
+            "CREATE TYPE nested.odd AS (at point);
+            CREATE TABLE nested.odds (id int, odd nested.odd);",
+        )
+        .await
+        .expect("Unsupported fixture should be created");
+    let Err(err) = SqlTable::new("postgres", &sqltable_pool, "nested.odds").await else {
+        panic!("A composite with an unsupported member should be refused");
+    };
+    assert!(err.to_string().contains("odd"), "{err}");
+
+    db_conn
+        .conn
+        .batch_execute("DROP SCHEMA nested CASCADE;")
+        .await
+        .expect("Nested fixtures should be dropped");
+}
+
+/// Timestamps read as microseconds, PostgreSQL's own precision, so every value it holds
+/// keeps its instant: before 1970, before 1677 and after 2262, where nanoseconds since
+/// 1970 overflow, at the top level and in a composite alike.
+async fn test_postgres_timestamps_in_microseconds(port: usize) {
+    let pool = common::get_postgres_connection_pool(port)
+        .await
+        .expect("Postgres connection pool should be created");
+    let db_conn = pool
+        .connect_direct()
+        .await
+        .expect("Connection should be established");
+    db_conn
+        .conn
+        .batch_execute(
+            "DROP SCHEMA IF EXISTS times CASCADE;
+            CREATE SCHEMA times;
+            CREATE TYPE times.stamped AS (at timestamptz);
+            CREATE TABLE times.values (id int, local timestamp, utc timestamptz, inner_at times.stamped);
+            INSERT INTO times.values VALUES
+                (1, '1969-12-31 23:59:59.5', '1969-12-31 23:59:59.5+00', ROW('1969-12-31 23:59:59.5+00')),
+                (2, '1500-01-01 00:00:00', '1500-01-01 00:00:00+00', ROW('1500-01-01 00:00:00+00')),
+                (3, '3000-01-01 00:00:00.000001', '3000-01-01 00:00:00.000001+00', ROW('3000-01-01 00:00:00.000001+00')),
+                (4, NULL, NULL, ROW(NULL));",
+        )
+        .await
+        .expect("Timestamp fixtures should be created");
+
+    let sqltable_pool: Arc<DynPostgresConnectionPool> = Arc::new(pool);
+    let table = SqlTable::new("postgres", &sqltable_pool, "times.values")
+        .await
+        .expect("SqlTable should infer the timestamps' schema");
+    let micros = |zone: Option<&str>| {
+        DataType::Timestamp(
+            datafusion::arrow::datatypes::TimeUnit::Microsecond,
+            zone.map(Into::into),
+        )
+    };
+    let ctx = SessionContext::new();
+    ctx.register_table("stamps", Arc::new(table))
+        .expect("Table should be registered");
+    let batches = ctx
+        .sql("SELECT * FROM stamps ORDER BY id")
+        .await
+        .expect("DataFrame should be created from query")
+        .collect()
+        .await
+        .expect("Timestamps should decode");
+    let schema = batches[0].schema();
+    assert_eq!(schema.field(1).data_type(), &micros(None));
+    assert_eq!(schema.field(2).data_type(), &micros(Some("UTC")));
+    assert_eq!(
+        schema.field(3).data_type(),
+        &DataType::Struct(vec![Field::new("at", micros(Some("UTC")), true)].into())
+    );
+    let printed = datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+        .unwrap()
+        .to_string();
+    let rows: Vec<String> = printed
+        .lines()
+        .filter(|line| line.starts_with('|'))
+        .skip(1)
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            "| 1 | 1969-12-31T23:59:59.500 | 1969-12-31T23:59:59.500Z | {at: 1969-12-31T23:59:59.500Z} |",
+            "| 2 | 1500-01-01T00:00:00 | 1500-01-01T00:00:00Z | {at: 1500-01-01T00:00:00Z} |",
+            "| 3 | 3000-01-01T00:00:00.000001 | 3000-01-01T00:00:00.000001Z | {at: 3000-01-01T00:00:00.000001Z} |",
+            "| 4 | | | {at: } |",
+        ],
+        "{printed}"
+    );
+
+    db_conn
+        .conn
+        .batch_execute("DROP SCHEMA times CASCADE;")
+        .await
+        .expect("Timestamp fixtures should be dropped");
 }
 
 /// An unconstrained `numeric` column (what `max()`, `avg()` and arithmetic over `numeric`
@@ -1048,4 +1505,267 @@ async fn test_postgres_io_runtime_segregation(container_manager: &Mutex<Containe
     assert!(!batches.is_empty(), "should return results via IO runtime");
 
     io_runtime.shutdown_background();
+}
+
+/// A pool given `hostaddr` reaches the server there without resolving `host`, and a query
+/// whose rows are dropped unread is cancelled on the server rather than left running.
+#[rstest]
+#[test_log::test(tokio::test)]
+async fn test_postgres_pinned_address_and_cancel_on_drop(
+    container_manager: &Mutex<ContainerManager>,
+) {
+    let mut container_manager = container_manager.lock().await;
+    if !container_manager.claimed {
+        container_manager.claimed = true;
+        start_container(&mut container_manager).await;
+    }
+
+    let mut params = common::get_pg_params(container_manager.port);
+    // `.invalid` resolves nowhere, so only the pinned address reaches the server.
+    params.insert("pg_host".to_string(), "customer.invalid".to_string());
+    params.insert("pg_hostaddr".to_string(), "127.0.0.1".to_string());
+    let pool = PostgresConnectionPool::new(to_secret_map(params))
+        .await
+        .expect("a pinned pool should connect without resolving its host");
+    let pool: Arc<DynPostgresConnectionPool> = Arc::new(pool);
+    let conn = pool.connect().await.expect("connect should work");
+    let async_conn = conn.as_async().expect("should be async connection");
+
+    // The first batch arrives at once; the row after the rest takes a minute.
+    let mut rows = async_conn
+        .query_arrow(
+            "SELECT g FROM generate_series(1, 20001) g \
+             WHERE g <= 20000 OR (SELECT true FROM pg_sleep(60) WHERE g > 20000)",
+            &[],
+            None,
+        )
+        .await
+        .expect("query should work");
+    futures::StreamExt::next(&mut rows)
+        .await
+        .expect("a first batch")
+        .expect("the first batch should be readable");
+    drop(rows);
+
+    let admin = common::get_postgres_connection_pool(container_manager.port)
+        .await
+        .expect("Postgres connection pool should be created")
+        .connect_direct()
+        .await
+        .expect("Connection should be established");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let running: i64 = admin
+            .conn
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE state = 'active' AND query LIKE '%pg_sleep(60)%' \
+                 AND pid <> pg_backend_pid()",
+                &[],
+            )
+            .await
+            .expect("pg_stat_activity should be readable")
+            .get(0);
+        if running == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the query whose rows were dropped is still running"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// A connection whose stream was dropped before its end is discarded by the pool, so the
+/// request to cancel its query never reaches the next statement.
+#[rstest]
+#[test_log::test(tokio::test)]
+async fn test_postgres_cancel_never_reaches_the_next_statement(
+    container_manager: &Mutex<ContainerManager>,
+) {
+    let mut container_manager = container_manager.lock().await;
+    if !container_manager.claimed {
+        container_manager.claimed = true;
+        start_container(&mut container_manager).await;
+    }
+
+    let mut params = common::get_pg_params(container_manager.port);
+    params.insert("pg_connection_pool_size".to_string(), "1".to_string());
+    let pool: Arc<DynPostgresConnectionPool> = Arc::new(
+        PostgresConnectionPool::new(to_secret_map(params))
+            .await
+            .expect("Postgres connection pool should be created"),
+    );
+
+    // One row past the first batch: the server has finished the query while the client still
+    // holds a row unread, so the cancel for it can only reach whatever runs next. Whether it
+    // arrives before or during that statement is a race, so it is run often enough to lose it.
+    for _ in 0..30 {
+        let mut rows = get_stream(
+            Arc::clone(&pool),
+            "SELECT g FROM generate_series(1, 4001) g".to_string(),
+            Arc::new(Schema::new(vec![Field::new("g", DataType::Int32, true)])),
+        )
+        .await
+        .expect("query should work");
+        futures::StreamExt::next(&mut rows)
+            .await
+            .expect("a first batch")
+            .expect("the first batch should be readable");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(rows);
+
+        let next = get_stream(
+            Arc::clone(&pool),
+            "SELECT true AS slept FROM pg_sleep(0.3)".to_string(),
+            Arc::new(Schema::new(vec![Field::new(
+                "slept",
+                DataType::Boolean,
+                true,
+            )])),
+        )
+        .await
+        .expect("the next statement should not be cancelled");
+        let batches = futures::StreamExt::collect::<Vec<_>>(next).await;
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0]
+                .as_ref()
+                .expect("the next statement should not be cancelled")
+                .num_rows(),
+            1
+        );
+    }
+}
+
+async fn backend_pid(pool: &PostgresConnectionPool) -> i32 {
+    pool.connect_direct()
+        .await
+        .expect("Connection should be established")
+        .conn
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("pg_backend_pid should be readable")
+        .get(0)
+}
+
+async fn single_connection_pool(port: usize) -> Arc<PostgresConnectionPool> {
+    let mut params = common::get_pg_params(port);
+    params.insert("pg_connection_pool_size".to_string(), "1".to_string());
+    Arc::new(
+        PostgresConnectionPool::new(to_secret_map(params))
+            .await
+            .expect("Postgres connection pool should be created"),
+    )
+}
+
+/// The pool discards the connection a stream was dropped unfinished on, and keeps the one a
+/// stream was read to its end on.
+#[rstest]
+#[test_log::test(tokio::test)]
+async fn test_postgres_a_cancelled_connection_is_discarded(
+    container_manager: &Mutex<ContainerManager>,
+) {
+    let mut container_manager = container_manager.lock().await;
+    if !container_manager.claimed {
+        container_manager.claimed = true;
+        start_container(&mut container_manager).await;
+    }
+
+    let pool = single_connection_pool(container_manager.port).await;
+    let before = backend_pid(&pool).await;
+
+    let mut rows = get_stream(
+        Arc::clone(&pool) as Arc<DynPostgresConnectionPool>,
+        "SELECT g FROM generate_series(1, 4001) g".to_string(),
+        Arc::new(Schema::new(vec![Field::new("g", DataType::Int32, true)])),
+    )
+    .await
+    .expect("query should work");
+    futures::StreamExt::next(&mut rows)
+        .await
+        .expect("a first batch")
+        .expect("the first batch should be readable");
+    drop(rows);
+    let after_drop = backend_pid(&pool).await;
+    assert_ne!(after_drop, before, "a cancelled connection is not reused");
+
+    let read = get_stream(
+        Arc::clone(&pool) as Arc<DynPostgresConnectionPool>,
+        "SELECT g FROM generate_series(1, 4001) g".to_string(),
+        Arc::new(Schema::new(vec![Field::new("g", DataType::Int32, true)])),
+    )
+    .await
+    .expect("query should work");
+    let batches = futures::StreamExt::collect::<Vec<_>>(read).await;
+    assert!(batches.iter().all(Result::is_ok));
+    assert_eq!(backend_pid(&pool).await, after_drop, "a finished one is");
+}
+
+/// A query abandoned before its first row, while the server is still working on it, is
+/// cancelled, and its connection is not reused.
+#[rstest]
+#[test_log::test(tokio::test)]
+async fn test_postgres_a_query_abandoned_before_its_first_row_is_cancelled(
+    container_manager: &Mutex<ContainerManager>,
+) {
+    let mut container_manager = container_manager.lock().await;
+    if !container_manager.claimed {
+        container_manager.claimed = true;
+        start_container(&mut container_manager).await;
+    }
+
+    let pool = single_connection_pool(container_manager.port).await;
+    let before = backend_pid(&pool).await;
+
+    let abandoned = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        get_stream(
+            Arc::clone(&pool) as Arc<DynPostgresConnectionPool>,
+            "SELECT true AS slept FROM pg_sleep(60) AS before_its_first_row".to_string(),
+            Arc::new(Schema::new(vec![Field::new(
+                "slept",
+                DataType::Boolean,
+                true,
+            )])),
+        ),
+    )
+    .await;
+    assert!(abandoned.is_err(), "the query has no row to return yet");
+
+    let admin = common::get_postgres_connection_pool(container_manager.port)
+        .await
+        .expect("Postgres connection pool should be created")
+        .connect_direct()
+        .await
+        .expect("Connection should be established");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let running: i64 = admin
+            .conn
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE state = 'active' AND query LIKE '%before_its_first_row%' \
+                 AND pid <> pg_backend_pid()",
+                &[],
+            )
+            .await
+            .expect("pg_stat_activity should be readable")
+            .get(0);
+        if running == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the abandoned query is still running"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    assert_ne!(
+        backend_pid(&pool).await,
+        before,
+        "the connection the cancel was sent on is not reused"
+    );
 }

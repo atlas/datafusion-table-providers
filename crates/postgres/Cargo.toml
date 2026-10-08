@@ -17,6 +17,7 @@ bb8 = "0.9"
 bb8-postgres = "0.9"
 bigdecimal = "0.4"
 byteorder = "1.5"
+bytes = "1"
 chrono = "0.4.44"
 datafusion = { workspace = true, default-features = false, features = ["sql"] }
 datafusion-federation = { workspace = true, features = ["sql"], optional = true }
@@ -25,24 +26,32 @@ fallible-iterator = "0.3"
 futures = "0.3"
 geo-types = "0.7"
 logos = "0.16"
-native-tls = "0.2"
+native-tls = { version = "0.2", optional = true }
 pem = "4.0"
-postgres-native-tls = "0.5.0"
+postgres-native-tls = { version = "0.5.0", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
 rust_decimal = { version = "1.38", features = ["db-postgres"] }
 sea-query = { version = "1.0.0", features = ["backend-postgres", "postgres-array", "with-rust_decimal", "with-bigdecimal", "with-time", "with-chrono"] }
 secrecy = "0.10"
 serde_json = "1.0"
 snafu = "0.9"
-tokio = { version = "1.52", features = ["macros", "fs"] }
+tokio = { version = "1.52", features = ["macros", "fs", "rt", "time"] }
+tokio-postgres-rustls = { version = "0.14", default-features = false, optional = true }
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1", "with-geo-types-0_7"] }
 tracing = "0.1"
 uuid = { version = "1.18" }
 
 [features]
-default = ["federation"]
+default = ["federation", "native-tls"]
 federation = ["dep:datafusion-federation", "datafusion-table-providers-common/federation"]
+# The TLS connections are made with. With both, rustls is used; with neither, only
+# `sslmode=disable` and `sslmode=prefer` connect, and in plain text.
+native-tls = ["dep:native-tls", "dep:postgres-native-tls"]
+rustls = ["dep:rustls", "dep:rustls-native-certs", "dep:tokio-postgres-rustls"]
 
 [dev-dependencies]
+rcgen = "0.14"
 geozero = { version = "0.15.1", features = ["with-wkb"] }
 
 [package.metadata.docs.rs]

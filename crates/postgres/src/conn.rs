@@ -3,10 +3,12 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
 
+use crate::arrow_sql_gen::nested;
 use crate::arrow_sql_gen::rows_to_arrow;
 use crate::arrow_sql_gen::schema::pg_data_type_to_arrow_type;
 use crate::arrow_sql_gen::schema::ParseContext;
 use crate::pool::ConnectionManager;
+use crate::tls;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
 use arrow::datatypes::SchemaRef;
@@ -16,7 +18,7 @@ use bb8_postgres::tokio_postgres::types::ToSql;
 use datafusion_table_providers_common::util::handle_unsupported_type_error;
 use datafusion_table_providers_common::util::schema::SchemaValidator;
 use datafusion_table_providers_common::UnsupportedTypeAction;
-use datafusion_table_providers_common::SOURCE_TYPE_METADATA_KEY;
+use datafusion_table_providers_common::{SOURCE_BASE_TYPE_METADATA_KEY, SOURCE_TYPE_METADATA_KEY};
 
 fn maybe_db_source_err(err: tokio_postgres::Error) -> Box<dyn Error + Send + Sync> {
     if let Some(err) = err.as_db_error() {
@@ -28,7 +30,8 @@ fn maybe_db_source_err(err: tokio_postgres::Error) -> Box<dyn Error + Send + Syn
 
 /// A pooled Postgres connection obtained from a [`PostgresConnectionPool`](crate::pool::PostgresConnectionPool).
 ///
-/// Dereferences to [`tokio_postgres::Client`](bb8_postgres::tokio_postgres::Client) for executing queries.
+/// Dereferences to a [`PostgresClient`](crate::pool::PostgresClient), and through it to
+/// [`tokio_postgres::Client`](bb8_postgres::tokio_postgres::Client), for executing queries.
 // Defined here rather than in `postgrespool` to avoid a type-resolution cycle
 // between the two modules (postgrespool imports PostgresConnection, which uses
 // this alias).
@@ -37,8 +40,14 @@ use datafusion::common::TableReference;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::RecordBatchStream;
 use futures::stream;
+use futures::Stream;
 use futures::StreamExt;
+use std::pin::Pin;
+use std::sync::atomic::Ordering;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use snafu::prelude::*;
 use tokio_postgres::Row;
@@ -47,12 +56,104 @@ use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::As
 use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::DbConnection;
 use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::Result;
 
-const SCHEMA_QUERY: &str = r"
-WITH custom_type_details AS (
+/// Resolves every domain to the type it is ultimately over, as `domain_base(domain, base,
+/// typmod)`. A domain's values are its base type's, so everything describes a domain by its
+/// base. The modifier (`numeric(10,2)`, `varchar(8)`) is the innermost domain's: a domain
+/// cannot take one of its own.
+macro_rules! domain_base_cte {
+    () => {
+        r"
+WITH RECURSIVE domain_chain AS (
+    SELECT t.oid AS domain, t.typbasetype AS base, t.typtypmod AS typmod
+    FROM pg_type t
+    WHERE t.typtype = 'd'
+UNION ALL
+    SELECT c.domain, t.typbasetype, t.typtypmod
+    FROM domain_chain c
+    JOIN pg_type t ON t.oid = c.base
+    WHERE t.typtype = 'd'
+),
+domain_base AS (
+    SELECT c.domain, c.base, c.typmod
+    FROM domain_chain c
+    JOIN pg_type t ON t.oid = c.base
+    WHERE t.typtype <> 'd'
+)
+"
+    };
+}
+
+const SCHEMA_QUERY: &str = concat!(
+    domain_base_cte!(),
+    r",
+columns AS (
+    SELECT
+        a.attnum,
+        a.attname,
+        a.attnotnull,
+        a.atttypid AS declared_type,
+        a.atttypmod AS declared_typmod,
+        COALESCE(db.base, a.atttypid) AS type,
+        COALESCE(db.typmod, a.atttypmod) AS typmod
+    FROM pg_class cls
+    JOIN pg_namespace ns ON cls.relnamespace = ns.oid
+    JOIN pg_attribute a ON a.attrelid = cls.oid
+    LEFT JOIN domain_base db ON db.domain = a.atttypid
+    WHERE ns.nspname = $1
+        AND cls.relname = $2
+        AND cls.relkind IN ('r','v','m','f','p')  -- covers tables, normal views, materialized views, foreign tables, & partitioned tables
+        AND a.attnum > 0
+        AND NOT a.attisdropped
+)
 SELECT
-t.typname,
-t.typtype,
-CASE
+    c.attname AS column_name,
+    CASE
+    -- when an array type is encountered, label as 'array'
+    WHEN t.typcategory = 'A' THEN 'array'
+    -- if it’s a user-defined enum or composite type then output that specific string
+    WHEN t.typtype = 'e' THEN 'enum'
+    WHEN t.typtype = 'c' THEN 'composite'
+    ELSE pg_catalog.format_type(c.type, c.typmod)
+    END AS data_type,
+    -- The type as Postgres itself names it, uncategorized: the branches above replace
+    -- `text[]`/`mood` with the 'array'/'enum' labels the Arrow mapping dispatches on,
+    -- which loses exactly the types the Arrow mapping is lossiest about. A domain is named
+    -- as itself here, not as its base.
+    pg_catalog.format_type(c.declared_type, c.declared_typmod) AS source_type,
+    CASE WHEN c.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable,
+    CASE
+    WHEN t.typcategory = 'A' THEN
+        jsonb_build_object(
+        'type', 'array',
+        'element_type', pg_catalog.format_type(
+            et.oid,
+            CASE WHEN edb.domain IS NULL THEN c.typmod ELSE edb.typmod END
+        ),
+        -- When the array element is a composite type, carry its attributes so the
+        -- array can be resolved to a List<Struct>. Null for non-composite elements.
+        'element_details', CASE WHEN et.typtype = 'c' THEN
+            jsonb_build_object(
+                'type', 'composite',
+                'attributes', (
+                    SELECT jsonb_agg(
+                        jsonb_build_object(
+                            'name', a2.attname,
+                            'type', pg_catalog.format_type(
+                                COALESCE(adb.base, a2.atttypid),
+                                COALESCE(adb.typmod, a2.atttypmod)
+                            )
+                        )
+                        ORDER BY a2.attnum
+                    )
+                    FROM pg_attribute a2
+                    LEFT JOIN domain_base adb ON adb.domain = a2.atttypid
+                    WHERE a2.attrelid = et.typrelid
+                    AND a2.attnum > 0
+                    AND NOT a2.attisdropped
+                )
+            )
+        END
+        )
     WHEN t.typtype = 'e' THEN
         jsonb_build_object(
             'type', 'enum',
@@ -69,85 +170,52 @@ CASE
                 SELECT jsonb_agg(
                     jsonb_build_object(
                         'name', a2.attname,
-                        'type', pg_catalog.format_type(a2.atttypid, a2.atttypmod)
+                        'type', pg_catalog.format_type(
+                            COALESCE(adb.base, a2.atttypid),
+                            COALESCE(adb.typmod, a2.atttypmod)
+                        )
                     )
                     ORDER BY a2.attnum
                 )
                 FROM pg_attribute a2
+                LEFT JOIN domain_base adb ON adb.domain = a2.atttypid
                 WHERE a2.attrelid = t.typrelid
                 AND a2.attnum > 0
                 AND NOT a2.attisdropped
             )
         )
-END as type_details
-FROM pg_type t
-JOIN pg_namespace n ON t.typnamespace = n.oid
-WHERE n.nspname = $1
-)
+    END AS type_details,
+    c.typmod,
+    -- For a domain, the type it is over, formatted as a column of that type would be.
+    CASE WHEN c.declared_type <> c.type
+        THEN pg_catalog.format_type(c.type, c.typmod)
+    END AS source_base_type
+FROM columns c
+JOIN pg_type t ON t.oid = c.type
+-- An array's element, itself read as its base if it is a domain.
+LEFT JOIN domain_base edb ON edb.domain = t.typelem
+LEFT JOIN pg_type et ON et.oid = COALESCE(edb.base, NULLIF(t.typelem, 0))
+ORDER BY c.attnum;
+"
+);
+
+/// The type modifier of every live attribute of the composite types in `$1`, through any
+/// domain, by type and position. See `nested::Modifiers`.
+const ATTRIBUTE_MODIFIERS_QUERY: &str = concat!(
+    domain_base_cte!(),
+    r"
 SELECT
-    a.attname AS column_name,
-    CASE
-    -- when an array type is encountered, label as 'array'
-    WHEN t.typcategory = 'A' THEN 'array'
-    -- if it’s a user-defined enum or composite type then output that specific string
-    WHEN t.typtype = 'e' THEN 'enum'
-    WHEN t.typtype = 'c' THEN 'composite'
-    ELSE pg_catalog.format_type(a.atttypid, a.atttypmod)
-    END AS data_type,
-    -- The type as Postgres itself names it, uncategorized: the branches above replace
-    -- `text[]`/`mood` with the 'array'/'enum' labels the Arrow mapping dispatches on,
-    -- which loses exactly the types the Arrow mapping is lossiest about.
-    pg_catalog.format_type(a.atttypid, a.atttypmod) AS source_type,
-    CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable,
-    CASE
-    WHEN t.typcategory = 'A' THEN
-        jsonb_build_object(
-        'type', 'array',
-        'element_type', (
-            SELECT pg_catalog.format_type(et.oid, a.atttypmod)
-            FROM pg_type t2
-            JOIN pg_type et ON t2.typelem = et.oid
-            WHERE t2.oid = a.atttypid
-        ),
-        -- When the array element is a composite type, carry its attributes so the
-        -- array can be resolved to a List<Struct>. Null for non-composite elements.
-        'element_details', (
-            SELECT jsonb_build_object(
-                'type', 'composite',
-                'attributes', (
-                    SELECT jsonb_agg(
-                        jsonb_build_object(
-                            'name', a2.attname,
-                            'type', pg_catalog.format_type(a2.atttypid, a2.atttypmod)
-                        )
-                        ORDER BY a2.attnum
-                    )
-                    FROM pg_attribute a2
-                    WHERE a2.attrelid = et.typrelid
-                    AND a2.attnum > 0
-                    AND NOT a2.attisdropped
-                )
-            )
-            FROM pg_type t2
-            JOIN pg_type et ON t2.typelem = et.oid
-            WHERE t2.oid = a.atttypid
-            AND et.typtype = 'c'
-        )
-        )
-    ELSE custom.type_details
-    END AS type_details
-FROM pg_class cls
-JOIN pg_namespace ns ON cls.relnamespace = ns.oid
-JOIN pg_attribute a ON a.attrelid = cls.oid
-LEFT JOIN pg_type t ON t.oid = a.atttypid
-LEFT JOIN custom_type_details custom ON custom.typname = t.typname
-WHERE ns.nspname = $1
-    AND cls.relname = $2
-    AND cls.relkind IN ('r','v','m')  -- covers tables, normal views, & materialized views
+    t.oid,
+    row_number() OVER (PARTITION BY t.oid ORDER BY a.attnum) - 1 AS position,
+    COALESCE(db.typmod, a.atttypmod) AS typmod
+FROM pg_type t
+JOIN pg_attribute a ON a.attrelid = t.typrelid
+LEFT JOIN domain_base db ON db.domain = a.atttypid
+WHERE t.oid = ANY($1)
     AND a.attnum > 0
     AND NOT a.attisdropped
-ORDER BY a.attnum;
-";
+"
+);
 
 // Redshift schema inference uses `SHOW COLUMNS FROM TABLE <db>.<schema>.<table>` rather
 // than the `svv_*` catalog views. The catalog views truncate `data_type` at the source
@@ -178,6 +246,26 @@ struct ColumnDef {
     source_type: String,
     nullable: bool,
     type_details: Option<serde_json::Value>,
+    /// The type modifier (`atttypmod`, through any domain); -1 when there is none or it is
+    /// not known.
+    typmod: i32,
+    /// For a domain, the type it is ultimately over. `None` for any other column.
+    source_base_type: Option<String>,
+}
+
+impl ColumnDef {
+    /// The Arrow field metadata recording the column's type as the source names it: the
+    /// Arrow mapping is lossy (`varchar(50)` and `citext` both land on `Utf8`).
+    fn metadata(&self) -> HashMap<String, String> {
+        let mut metadata = HashMap::from([(
+            SOURCE_TYPE_METADATA_KEY.to_string(),
+            self.source_type.clone(),
+        )]);
+        if let Some(base) = &self.source_base_type {
+            metadata.insert(SOURCE_BASE_TYPE_METADATA_KEY.to_string(), base.clone());
+        }
+        metadata
+    }
 }
 
 /// Quotes a SQL identifier for safe interpolation into a statement that can't use bind
@@ -295,9 +383,87 @@ fn format_postgres_query_error(source: &bb8_postgres::tokio_postgres::Error) -> 
     rendered
 }
 
+/// How long a request to cancel a query may take before it is abandoned.
+const CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A request to cancel a query, sent when dropped unless disarmed first: the server stops
+/// working on a query no one waits for, rather than run it to completion, or its timeout.
+struct Cancel<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Cancel<F> {
+    fn new(cancel: F) -> Self {
+        Self(Some(cancel))
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl<F: FnOnce()> Drop for Cancel<F> {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.0.take() {
+            cancel();
+        }
+    }
+}
+
+/// A query's rows, whose query is cancelled if they are dropped before they end.
+struct CancelOnDrop<S, F: FnOnce()> {
+    rows: S,
+    cancel: Cancel<F>,
+}
+
+impl<S, T, E, F> Stream for CancelOnDrop<S, F>
+where
+    S: Stream<Item = std::result::Result<T, E>> + Unpin,
+    F: FnOnce() + Unpin,
+{
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let polled = self.rows.poll_next_unpin(cx);
+        // After its end or an error, the statement is no longer running.
+        if matches!(polled, Poll::Ready(None | Some(Err(_)))) {
+            self.cancel.disarm();
+        }
+        polled
+    }
+}
+
 pub struct PostgresConnection {
     pub conn: PostgresPooledConnection,
     unsupported_type_action: UnsupportedTypeAction,
+    /// The TLS a request to cancel a query connects with; without it, none is sent.
+    cancel_tls: Option<tls::Connector>,
+}
+
+/// A query's batches, holding the connection they are read from until they end or are
+/// dropped, so the pool cannot hand the connection to another query meanwhile.
+struct HoldingConnection {
+    schema: SchemaRef,
+    // Declared before `conn`, so it is dropped first: dropping it unfinished sends the cancel
+    // request, after which the pool discards the connection instead of reusing it.
+    batches: SendableRecordBatchStream,
+    conn: Option<Box<PostgresConnection>>,
+}
+
+impl Stream for HoldingConnection {
+    type Item = datafusion::error::Result<arrow::array::RecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let polled = self.batches.poll_next_unpin(cx);
+        if let Poll::Ready(None) = polled {
+            self.conn = None;
+        }
+        polled
+    }
+}
+
+impl RecordBatchStream for HoldingConnection {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
 }
 
 impl SchemaValidator for PostgresConnection {
@@ -329,6 +495,17 @@ impl<'a> DbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)> for Post
     ) -> Option<&dyn AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>> {
         Some(self)
     }
+
+    fn release_after(
+        self: Box<Self>,
+        stream: SendableRecordBatchStream,
+    ) -> SendableRecordBatchStream {
+        Box::pin(HoldingConnection {
+            schema: stream.schema(),
+            batches: stream,
+            conn: Some(self),
+        })
+    }
 }
 
 #[async_trait::async_trait]
@@ -339,6 +516,7 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
         PostgresConnection {
             conn,
             unsupported_type_action: UnsupportedTypeAction::default(),
+            cancel_tls: None,
         }
     }
 
@@ -404,13 +582,36 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
             return self.infer_schema_from_data(table_reference).await;
         }
 
+        let (nested_types, modifiers) = match variant {
+            PostgresVariant::Default => self.nested_types(table_reference, &columns).await?,
+            PostgresVariant::Redshift => (HashMap::new(), nested::Modifiers::new()),
+        };
+
         let mut fields = Vec::new();
         for column in columns {
+            // Typed by the same mapping its rows are decoded with; see `nested`.
+            if let Some(ty) = nested_types.get(&column.name) {
+                match nested::data_type_with(ty, column.typmod, &modifiers, &column.name) {
+                    Ok(arrow_type) => fields.push(
+                        Field::new(&column.name, arrow_type, column.nullable)
+                            .with_metadata(column.metadata()),
+                    ),
+                    Err(_) => handle_unsupported_type_error(
+                        self.unsupported_type_action,
+                        datafusion_table_providers_common::sql::db_connection_pool::dbconnection::Error::UnsupportedDataType {
+                            data_type: column.source_type.clone(),
+                            field_name: column.name.clone(),
+                        },
+                    )?,
+                }
+                continue;
+            }
+
             let mut context =
                 ParseContext::new().with_unsupported_type_action(self.unsupported_type_action);
 
-            if let Some(type_details) = column.type_details {
-                context = context.with_type_details(type_details);
+            if let Some(type_details) = &column.type_details {
+                context = context.with_type_details(type_details.clone());
             };
 
             let Ok(arrow_type) =
@@ -427,12 +628,9 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
                 continue;
             };
 
-            // The Arrow mapping is lossy (`varchar(50)` and `citext` both land on
-            // `Utf8`), so keep the source type the catalog reported alongside it.
             fields.push(
-                Field::new(column.name, arrow_type, column.nullable).with_metadata(HashMap::from(
-                    [(SOURCE_TYPE_METADATA_KEY.to_string(), column.source_type)],
-                )),
+                Field::new(&column.name, arrow_type, column.nullable)
+                    .with_metadata(column.metadata()),
             );
         }
 
@@ -448,11 +646,20 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
     ) -> Result<SendableRecordBatchStream> {
         // TODO: We should have a way to detect if params have been passed
         // if they haven't we should use .copy_out instead, because it should be much faster
+        // Armed before the query is sent: the server holds back even the reply to the query
+        // starting until its first rows are ready or it ends, so the wait can be long.
+        let mut cancel = Cancel::new(self.canceller());
         let streamable = self
             .conn
             .query_raw(sql, params.iter().copied()) // use .query_raw to get access to the underlying RowStream
-            .await
-            .context(QuerySnafu)?;
+            .await;
+        if streamable.is_err() {
+            cancel.disarm();
+        }
+        let streamable = CancelOnDrop {
+            rows: Box::pin(streamable.context(QuerySnafu)?),
+            cancel,
+        };
 
         // chunk the stream into groups of rows
         let mut stream = streamable.chunks(4_000).boxed().map(move |rows| {
@@ -482,7 +689,7 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
                         yield Ok(batch); // we can yield the batch as-is because we've already converted to Arrow in the chunk map
                     }
                     Err(e) => {
-                        yield Err(DataFusionError::Execution(format!("Failed to fetch batch: {e}")));
+                        yield Err(DataFusionError::External(Box::new(e)));
                     }
                 }
            }
@@ -504,6 +711,39 @@ impl PostgresConnection {
     pub fn with_unsupported_type_action(mut self, action: UnsupportedTypeAction) -> Self {
         self.unsupported_type_action = action;
         self
+    }
+
+    #[must_use]
+    pub(crate) fn with_cancel_tls(mut self, tls: tls::Connector) -> Self {
+        self.cancel_tls = Some(tls);
+        self
+    }
+
+    /// Asks the server to cancel the query this connection is running, from a task of its
+    /// own that gives up after [`CANCEL_TIMEOUT`], and has the pool discard the connection.
+    /// Taken before the query is sent.
+    #[cfg_attr(
+        not(any(feature = "native-tls", feature = "rustls")),
+        allow(clippy::clone_on_copy)
+    )]
+    fn canceller(&self) -> impl FnOnce() + Send + Unpin + 'static {
+        let token = self.conn.cancel_token();
+        let tls = self.cancel_tls.clone();
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        let cancelled = Arc::clone(&self.conn.cancelled);
+        move || {
+            let (Some(tls), Some(runtime)) = (tls, runtime) else {
+                return;
+            };
+            cancelled.store(true, Ordering::Relaxed);
+            runtime.spawn(async move {
+                match tokio::time::timeout(CANCEL_TIMEOUT, token.cancel_query(tls)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::debug!("could not cancel a postgres query: {e}"),
+                    Err(_) => tracing::debug!("cancelling a postgres query timed out"),
+                }
+            });
+        }
     }
 
     pub async fn get_variant(
@@ -533,6 +773,77 @@ impl PostgresConnection {
         };
 
         Ok(variant)
+    }
+
+    /// The Postgres types of those of `columns` that are decoded recursively — composites,
+    /// and arrays of anything but the common scalars — keyed by column name, with the type
+    /// modifiers of the attributes of every composite they hold.
+    ///
+    /// The catalog query describes a composite's attributes by type name only, which cannot
+    /// say what a nested composite holds. The server describes each column's type in full
+    /// for a statement, so these are read from one: prepared, never executed. A `Type`
+    /// carries no modifiers, so those are read from the catalog for the composites found.
+    async fn nested_types(
+        &self,
+        table_reference: &TableReference,
+        columns: &[ColumnDef],
+    ) -> Result<
+        (
+            HashMap<String, tokio_postgres::types::Type>,
+            nested::Modifiers,
+        ),
+        datafusion_table_providers_common::sql::db_connection_pool::dbconnection::Error,
+    > {
+        let schema_error = |e| {
+            datafusion_table_providers_common::sql::db_connection_pool::dbconnection::Error::UnableToGetSchema {
+                source: maybe_db_source_err(e),
+            }
+        };
+
+        let candidates: Vec<String> = columns
+            .iter()
+            .filter(|column| matches!(column.data_type.as_str(), "composite" | "array"))
+            .map(|column| quote_pg_identifier(&column.name))
+            .collect();
+        if candidates.is_empty() {
+            return Ok((HashMap::new(), nested::Modifiers::new()));
+        }
+
+        let sql = format!(
+            "SELECT {} FROM {}.{}",
+            candidates.join(", "),
+            quote_pg_identifier(table_reference.schema().unwrap_or("public")),
+            quote_pg_identifier(table_reference.table()),
+        );
+        let statement = self.conn.prepare(&sql).await.map_err(schema_error)?;
+        let types: HashMap<_, _> = statement
+            .columns()
+            .iter()
+            .filter(|column| nested::decodes(column.type_()))
+            .map(|column| (column.name().to_string(), column.type_().clone()))
+            .collect();
+
+        let mut composites = Vec::new();
+        for ty in types.values() {
+            nested::composites(ty, &mut composites);
+        }
+        let mut modifiers = nested::Modifiers::new();
+        if !composites.is_empty() {
+            let rows = self
+                .conn
+                .query(ATTRIBUTE_MODIFIERS_QUERY, &[&composites])
+                .await
+                .map_err(schema_error)?;
+            for row in rows {
+                let position = usize::try_from(row.get::<usize, i64>(1)).unwrap_or_default();
+                modifiers.insert(
+                    (row.get::<usize, u32>(0), position),
+                    row.get::<usize, i32>(2),
+                );
+            }
+        }
+
+        Ok((types, modifiers))
     }
 
     async fn query_variant_and_schema(
@@ -566,6 +877,8 @@ impl PostgresConnection {
                         source_type: row.get::<usize, String>(2),
                         nullable: row.get::<usize, String>(3) == "YES",
                         type_details: row.get::<usize, Option<serde_json::Value>>(4),
+                        typmod: row.get::<usize, i32>(5),
+                        source_base_type: row.get::<usize, Option<String>>(6),
                     })
                     .collect()
             }
@@ -674,6 +987,8 @@ impl PostgresConnection {
                     data_type,
                     nullable,
                     type_details: None,
+                    typmod: -1,
+                    source_base_type: None,
                 }
             })
             .collect();
@@ -729,5 +1044,64 @@ impl PostgresConnection {
             })?;
 
         Ok(rec.schema())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cancel, CancelOnDrop};
+    use futures::{stream, StreamExt};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    type Rows = stream::Iter<std::vec::IntoIter<Result<u8, ()>>>;
+
+    fn rows(items: Vec<Result<u8, ()>>) -> (CancelOnDrop<Rows, impl FnOnce()>, Arc<AtomicBool>) {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancelled);
+        let rows = CancelOnDrop {
+            rows: stream::iter(items),
+            cancel: Cancel::new(move || flag.store(true, Ordering::SeqCst)),
+        };
+        (rows, cancelled)
+    }
+
+    #[test]
+    fn a_query_waited_on_is_cancelled_unless_it_failed() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancelled);
+        drop(Cancel::new(move || flag.store(true, Ordering::SeqCst)));
+        assert!(cancelled.load(Ordering::SeqCst));
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancelled);
+        let mut failed = Cancel::new(move || flag.store(true, Ordering::SeqCst));
+        failed.disarm();
+        drop(failed);
+        assert!(!cancelled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_stream_dropped_before_its_end_cancels_its_query() {
+        let (mut unread, cancelled) = rows(vec![Ok(1), Ok(2)]);
+        assert_eq!(unread.next().await, Some(Ok(1)));
+        assert!(!cancelled.load(Ordering::SeqCst));
+        drop(unread);
+        assert!(cancelled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_ended_cancels_nothing() {
+        let (read, cancelled) = rows(vec![Ok(1), Ok(2)]);
+        assert_eq!(read.collect::<Vec<_>>().await, [Ok(1), Ok(2)]);
+        assert!(!cancelled.load(Ordering::SeqCst));
+
+        let (mut failed, cancelled) = rows(vec![Err(()), Ok(2)]);
+        assert_eq!(failed.next().await, Some(Err(())));
+        drop(failed);
+        assert!(
+            !cancelled.load(Ordering::SeqCst),
+            "a statement that failed is no longer running"
+        );
     }
 }

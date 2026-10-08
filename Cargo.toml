@@ -53,7 +53,7 @@ datafusion-table-providers-flightsql = { version = "0.14.0", path = "crates/flig
 datafusion-table-providers-mongodb = { version = "0.14.0", path = "crates/mongodb" }
 datafusion-table-providers-mysql = { version = "0.14.0", path = "crates/mysql" }
 datafusion-table-providers-sqlite = { version = "0.14.0", path = "crates/sqlite" }
-datafusion-table-providers-postgres = { version = "0.14.0", path = "crates/postgres" }
+datafusion-table-providers-postgres = { version = "0.14.0", path = "crates/postgres", default-features = false }
 datafusion-table-providers-duckdb = { version = "0.14.0", path = "crates/duckdb" }
 datafusion-table-providers-adbc = { version = "0.14.0", path = "crates/adbc" }
 datafusion-table-providers-oracle = { version = "0.14.0", path = "crates/oracle" }

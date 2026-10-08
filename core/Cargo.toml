@@ -20,7 +20,7 @@ datafusion-table-providers-flightsql = { workspace = true, optional = true }
 datafusion-table-providers-mongodb = { workspace = true, optional = true }
 datafusion-table-providers-mysql = { workspace = true, optional = true }
 datafusion-table-providers-odbc = { workspace = true, optional = true }
-datafusion-table-providers-postgres = { workspace = true, optional = true }
+datafusion-table-providers-postgres = { workspace = true, optional = true, features = ["federation"] }
 datafusion-table-providers-sqlite = { workspace = true, optional = true }
 datafusion-table-providers-oracle = { workspace = true, optional = true }
 
@@ -35,7 +35,7 @@ async-trait = "0.1"
 bollard = "=0.21.1"
 chrono = "0.4.44"
 clickhouse = "0.15"
-datafusion = { workspace = true, default-features = false, features = ["parquet", "sql"] }
+datafusion = { workspace = true, default-features = false, features = ["nested_expressions", "parquet", "sql"] }
 datafusion-federation = { workspace = true, features = ["sql"] }
 duckdb = { workspace = true, features = [
   "bundled",
@@ -61,6 +61,8 @@ rstest = "0.26.1"
 secrecy = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.11"
+rcgen = "0.14"
 tempfile = "3.27.0"
 test-log = { version = "0.2", features = ["trace"] }
 tokio = { version = "1.52", features = ["macros", "fs", "rt-multi-thread"] }
@@ -70,7 +72,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [features]
-default = []
+default = ["postgres-native-tls"]
 
 adbc = ["dep:datafusion-table-providers-adbc"]
 clickhouse = ["dep:datafusion-table-providers-clickhouse"]
@@ -80,6 +82,10 @@ mongodb = ["dep:datafusion-table-providers-mongodb"]
 mysql = ["dep:datafusion-table-providers-mysql"]
 odbc = ["dep:datafusion-table-providers-odbc"]
 postgres = ["dep:datafusion-table-providers-postgres"]
+# The TLS `postgres` connects with; see the postgres crate. Only the default feature
+# brings native-tls, so `default-features = false` with `postgres-rustls` is free of OpenSSL.
+postgres-native-tls = ["datafusion-table-providers-postgres?/native-tls"]
+postgres-rustls = ["datafusion-table-providers-postgres?/rustls"]
 sqlite = ["dep:datafusion-table-providers-sqlite"]
 oracle = ["dep:datafusion-table-providers-oracle"]
 
