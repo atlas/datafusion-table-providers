@@ -1,5 +1,6 @@
 pub mod arrow_sql_gen;
 pub mod conn;
+pub mod copy;
 pub mod pool;
 
 use crate::arrow_sql_gen::statement_ext::CreateTableBuilderPostgresExt;
@@ -103,6 +104,9 @@ pub enum Error {
     UnableToInsertArrowBatch {
         source: tokio_postgres::error::Error,
     },
+
+    #[snafu(display("Unable to copy Arrow batch to Postgres table: {source}"))]
+    UnableToCopyArrowBatch { source: copy::Error },
 
     #[snafu(display("Unable to create insertion statement for Postgres table: {source}"))]
     UnableToCreateInsertStatement { source: SqlGenError },
@@ -409,12 +413,36 @@ impl Postgres {
         row.get(0)
     }
 
+    /// Writes `batch` with binary `COPY` when every column's type can be written that way,
+    /// and otherwise as an `INSERT` statement.
     async fn insert_batch(
         &self,
         transaction: &Transaction<'_>,
         batch: RecordBatch,
         on_conflict: Option<OnConflict>,
     ) -> Result<()> {
+        let table = self.table.to_quoted_string();
+        let columns = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| format!("\"{}\"", field.name().replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let types: Vec<_> = transaction
+            .prepare(&format!("SELECT {columns} FROM {table} LIMIT 0"))
+            .await
+            .context(UnableToInsertArrowBatchSnafu)?
+            .columns()
+            .iter()
+            .map(|column| column.type_().clone())
+            .collect();
+        if copy::supported(batch.schema().fields(), &types) {
+            return self
+                .copy_batch(transaction, &table, &columns, &batch, &types, on_conflict)
+                .await;
+        }
+
         let batches = vec![batch];
         let insert_table_builder = InsertBuilder::new(&self.table, &batches);
 
@@ -430,6 +458,44 @@ impl Postgres {
             .await
             .context(UnableToInsertArrowBatchSnafu)?;
 
+        Ok(())
+    }
+
+    /// Writes `batch` to `columns` of `table`, of `types`, with binary `COPY`: straight into
+    /// the table, or, to resolve conflicts, into a temporary copy of it that is then
+    /// inserted with `on_conflict`.
+    async fn copy_batch(
+        &self,
+        transaction: &Transaction<'_>,
+        table: &str,
+        columns: &str,
+        batch: &RecordBatch,
+        types: &[bb8_postgres::tokio_postgres::types::Type],
+        on_conflict: Option<OnConflict>,
+    ) -> Result<()> {
+        let Some(on_conflict) = on_conflict else {
+            copy::copy_in(transaction, table, columns, batch, types)
+                .await
+                .context(UnableToCopyArrowBatchSnafu)?;
+            return Ok(());
+        };
+        let staged = "\"datafusion_table_providers_copy\"";
+        transaction
+            .batch_execute(&format!(
+                "CREATE TEMPORARY TABLE {staged} (LIKE {table} INCLUDING DEFAULTS) ON COMMIT DROP"
+            ))
+            .await
+            .context(UnableToInsertArrowBatchSnafu)?;
+        copy::copy_in(transaction, staged, columns, batch, types)
+            .await
+            .context(UnableToCopyArrowBatchSnafu)?;
+        transaction
+            .batch_execute(&format!(
+                "INSERT INTO {table} ({columns}) SELECT {columns} FROM {staged} {}; DROP TABLE {staged}",
+                on_conflict.build_on_conflict_statement(&self.schema)
+            ))
+            .await
+            .context(UnableToInsertArrowBatchSnafu)?;
         Ok(())
     }
 

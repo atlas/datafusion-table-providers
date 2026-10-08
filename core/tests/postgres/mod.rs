@@ -29,6 +29,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, MutexGuard};
 
 mod common;
+mod copy;
 mod schema;
 
 async fn arrow_postgres_round_trip(
@@ -179,6 +180,20 @@ async fn test_arrow_postgres_roundtrip(
         &format!("{table_name}_types"),
     )
     .await;
+}
+
+#[rstest]
+#[test_log::test(tokio::test)]
+async fn test_postgres_copy_writes(container_manager: &Mutex<ContainerManager>) {
+    let mut container_manager = container_manager.lock().await;
+    if !container_manager.claimed {
+        container_manager.claimed = true;
+        start_container(&mut container_manager).await;
+    }
+
+    copy::test_postgres_copy_writes_composites_arrays_and_jsonb(container_manager.port).await;
+    copy::test_postgres_copy_resolves_conflicts(container_manager.port).await;
+    copy::test_postgres_copy_falls_back_to_insert(container_manager.port).await;
 }
 
 #[rstest]
