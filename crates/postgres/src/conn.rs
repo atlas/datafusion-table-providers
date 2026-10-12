@@ -50,7 +50,8 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use snafu::prelude::*;
-use tokio_postgres::Row;
+use tokio_postgres::types::Type;
+use tokio_postgres::{Row, RowStream};
 
 use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::AsyncDbConnection;
 use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::DbConnection;
@@ -656,49 +657,7 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
         if streamable.is_err() {
             cancel.disarm();
         }
-        let streamable = CancelOnDrop {
-            rows: Box::pin(streamable.context(QuerySnafu)?),
-            cancel,
-        };
-
-        // chunk the stream into groups of rows
-        let mut stream = streamable.chunks(4_000).boxed().map(move |rows| {
-            let rows = rows
-                .into_iter()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .context(QuerySnafu)?;
-            let rec = rows_to_arrow(rows.as_slice(), &projected_schema).context(ConversionSnafu)?;
-            Ok::<_, PostgresError>(rec)
-        });
-
-        let Some(first_chunk) = stream.next().await else {
-            return Ok(Box::pin(RecordBatchStreamAdapter::new(
-                Arc::new(Schema::empty()),
-                stream::empty(),
-            )));
-        };
-
-        let first_chunk = first_chunk?;
-        let schema = first_chunk.schema(); // pull out the schema from the first chunk to use in the DataFusion Stream Adapter
-
-        let output_stream = stream! {
-           yield Ok(first_chunk);
-           while let Some(batch) = stream.next().await {
-                match batch {
-                    Ok(batch) => {
-                        yield Ok(batch); // we can yield the batch as-is because we've already converted to Arrow in the chunk map
-                    }
-                    Err(e) => {
-                        yield Err(DataFusionError::External(Box::new(e)));
-                    }
-                }
-           }
-        };
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            output_stream,
-        )))
+        arrow_batches(streamable.context(QuerySnafu)?, cancel, projected_schema).await
     }
 
     async fn execute(&self, sql: &str, params: &[&'a (dyn ToSql + Sync)]) -> Result<u64> {
@@ -706,7 +665,84 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
     }
 }
 
+/// `rows` as Arrow batches of up to 4,000 rows, typed from `projected_schema` or else
+/// from the rows' columns; `cancel` is sent if they are dropped before their end.
+async fn arrow_batches<F>(
+    rows: RowStream,
+    cancel: Cancel<F>,
+    projected_schema: Option<SchemaRef>,
+) -> Result<SendableRecordBatchStream>
+where
+    F: FnOnce() + Send + Unpin + 'static,
+{
+    let streamable = CancelOnDrop {
+        rows: Box::pin(rows),
+        cancel,
+    };
+
+    // chunk the stream into groups of rows
+    let mut stream = streamable.chunks(4_000).boxed().map(move |rows| {
+        let rows = rows
+            .into_iter()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context(QuerySnafu)?;
+        let rec = rows_to_arrow(rows.as_slice(), &projected_schema).context(ConversionSnafu)?;
+        Ok::<_, PostgresError>(rec)
+    });
+
+    let Some(first_chunk) = stream.next().await else {
+        return Ok(Box::pin(RecordBatchStreamAdapter::new(
+            Arc::new(Schema::empty()),
+            stream::empty(),
+        )));
+    };
+
+    let first_chunk = first_chunk?;
+    let schema = first_chunk.schema(); // pull out the schema from the first chunk to use in the DataFusion Stream Adapter
+
+    let output_stream = stream! {
+       yield Ok(first_chunk);
+       while let Some(batch) = stream.next().await {
+            match batch {
+                Ok(batch) => {
+                    yield Ok(batch); // we can yield the batch as-is because we've already converted to Arrow in the chunk map
+                }
+                Err(e) => {
+                    yield Err(DataFusionError::External(Box::new(e)));
+                }
+            }
+       }
+    };
+
+    Ok(Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        output_stream,
+    )))
+}
+
 impl PostgresConnection {
+    /// Runs `sql` with each parameter sent as the type it is paired with, so the server
+    /// infers none: an `i64` can be compared with an `int4` column, and a parameter the
+    /// statement never uses can be bound as a typed `NULL`. Otherwise as
+    /// [`query_arrow`](AsyncDbConnection::query_arrow) without a projected schema: the
+    /// batches are typed from the statement's columns, an empty result has an empty
+    /// schema, and dropping the stream before its end cancels the query.
+    pub async fn query_typed_arrow(
+        &self,
+        sql: &str,
+        params: &[(&(dyn ToSql + Sync), Type)],
+    ) -> Result<SendableRecordBatchStream> {
+        let mut cancel = Cancel::new(self.canceller());
+        let streamable = self
+            .conn
+            .query_typed_raw(sql, params.iter().map(|(value, ty)| (*value, ty.clone())))
+            .await;
+        if streamable.is_err() {
+            cancel.disarm();
+        }
+        arrow_batches(streamable.context(QuerySnafu)?, cancel, None).await
+    }
+
     #[must_use]
     pub fn with_unsupported_type_action(mut self, action: UnsupportedTypeAction) -> Self {
         self.unsupported_type_action = action;

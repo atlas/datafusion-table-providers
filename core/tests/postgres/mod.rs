@@ -1769,3 +1769,88 @@ async fn test_postgres_a_query_abandoned_before_its_first_row_is_cancelled(
         "the connection the cancel was sent on is not reused"
     );
 }
+
+/// Parameters sent with their types are taken as those types: an `int8` compared with an
+/// `int4` column and an unused parameter bound as a typed `NULL`, both of which inferring the
+/// parameters' types refuses. An empty result has an empty schema, and dropping the stream
+/// before its end cancels the query.
+#[rstest]
+#[test_log::test(tokio::test)]
+async fn test_postgres_query_typed_arrow(container_manager: &Mutex<ContainerManager>) {
+    use datafusion_table_providers::sql::db_connection_pool::dbconnection::DbConnection;
+    use tokio_postgres::types::Type;
+
+    let mut container_manager = container_manager.lock().await;
+    if !container_manager.claimed {
+        container_manager.claimed = true;
+        start_container(&mut container_manager).await;
+    }
+
+    let pool = single_connection_pool(container_manager.port).await;
+    let conn = pool
+        .connect_direct()
+        .await
+        .expect("Connection should be established");
+
+    let above: i64 = 1;
+    let unused: Option<i64> = None;
+    let sql = "SELECT k, $2::bigint IS NULL AS unused \
+               FROM (VALUES (1::int4), (2::int4), (3::int4)) AS t(k) \
+               WHERE k > $1 ORDER BY k";
+    assert!(
+        conn.conn.query(sql, &[&above, &unused]).await.is_err(),
+        "the server infers `int4` for `$1`, which an `i64` is refused as"
+    );
+    let batches: Vec<RecordBatch> = futures::TryStreamExt::try_collect(
+        conn.query_typed_arrow(sql, &[(&above, Type::INT8), (&unused, Type::INT8)])
+            .await
+            .expect("a typed query should start"),
+    )
+    .await
+    .expect("its rows should be readable");
+    assert_eq!(batches.len(), 1);
+    let keys = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("`k` is int4");
+    assert_eq!(keys.values(), &[2, 3]);
+
+    let none: i64 = 10;
+    let empty = conn
+        .query_typed_arrow(
+            "SELECT k FROM (VALUES (1::int4)) AS t(k) WHERE k > $1",
+            &[(&none, Type::INT8)],
+        )
+        .await
+        .expect("a typed query should start");
+    assert!(empty.schema().fields().is_empty());
+    assert!(futures::StreamExt::collect::<Vec<_>>(empty)
+        .await
+        .is_empty());
+    drop(conn);
+
+    let before = backend_pid(&pool).await;
+    let conn = pool
+        .connect_direct()
+        .await
+        .expect("Connection should be established");
+    let mut rows = conn
+        .query_typed_arrow(
+            "SELECT g FROM generate_series(1, $1) g",
+            &[(&4001_i64, Type::INT8)],
+        )
+        .await
+        .expect("a typed query should start");
+    futures::StreamExt::next(&mut rows)
+        .await
+        .expect("a first batch")
+        .expect("the first batch should be readable");
+    let rows = Box::new(conn).release_after(rows);
+    drop(rows);
+    assert_ne!(
+        backend_pid(&pool).await,
+        before,
+        "a typed query dropped before its end is cancelled, and its connection is not reused"
+    );
+}
