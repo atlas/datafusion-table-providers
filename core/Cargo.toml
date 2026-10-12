@@ -66,6 +66,7 @@ rcgen = "0.14"
 tempfile = "3.27.0"
 test-log = { version = "0.2", features = ["trace"] }
 tokio = { version = "1.52", features = ["macros", "fs", "rt-multi-thread"] }
+tokio-postgres = "0.7"
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.14", features = ["tls-native-roots", "tls-webpki-roots"] }
 tracing = "0.1"

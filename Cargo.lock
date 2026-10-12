@@ -2516,6 +2516,7 @@ dependencies = [
  "tempfile",
  "test-log",
  "tokio",
+ "tokio-postgres",
  "tokio-stream",
  "tonic",
  "tracing",
