@@ -1854,3 +1854,118 @@ async fn test_postgres_query_typed_arrow(container_manager: &Mutex<ContainerMana
         "a typed query dropped before its end is cancelled, and its connection is not reused"
     );
 }
+
+/// A session dropped while its statement runs cancels it, through the pinned address its
+/// connection used, and closes its socket: the server ends the backend and rolls back what
+/// its transaction wrote. Closing the socket alone would leave `pg_sleep` running.
+#[rstest]
+#[test_log::test(tokio::test)]
+async fn test_postgres_a_dropped_session_is_cancelled_and_closed(
+    container_manager: &Mutex<ContainerManager>,
+) {
+    use datafusion_table_providers::sql::db_connection_pool::{
+        postgrespool::connect_session, PasswordProvider, StaticPasswordProvider,
+    };
+    use secrecy::SecretString;
+    use std::time::Duration;
+
+    let mut container_manager = container_manager.lock().await;
+    if !container_manager.claimed {
+        container_manager.claimed = true;
+        start_container(&mut container_manager).await;
+    }
+
+    let admin = common::get_postgres_connection_pool(container_manager.port)
+        .await
+        .expect("Postgres connection pool should be created")
+        .connect_direct()
+        .await
+        .expect("Connection should be established");
+    admin
+        .conn
+        .batch_execute("CREATE TABLE dropped_session_writes (id int)")
+        .await
+        .expect("the table should be created");
+
+    let mut params = common::get_pg_params(container_manager.port);
+    // `.invalid` resolves nowhere, so only the pinned address reaches the server.
+    params.insert("pg_host".to_string(), "customer.invalid".to_string());
+    params.insert("pg_hostaddr".to_string(), "127.0.0.1".to_string());
+    let password = params.remove("pg_pass").expect("pg_pass should be present");
+    let provider: Arc<dyn PasswordProvider> =
+        Arc::new(StaticPasswordProvider::new(SecretString::from(password)));
+    let session = connect_session(
+        to_secret_map(params),
+        Some(provider),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("a pinned session should connect without resolving its host");
+
+    let pid: i32 = session
+        .client
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("pg_backend_pid should be readable")
+        .get(0);
+    session
+        .client
+        .batch_execute("BEGIN")
+        .await
+        .expect("a transaction should begin");
+    session
+        .client
+        .execute("INSERT INTO dropped_session_writes VALUES (1)", &[])
+        .await
+        .expect("the row should be written");
+    let sleeping = tokio::time::timeout(
+        Duration::from_secs(1),
+        session.client.batch_execute("SELECT pg_sleep(60)"),
+    )
+    .await;
+    assert!(sleeping.is_err(), "the statement has not finished");
+
+    let active: i64 = admin
+        .conn
+        .query_one(
+            "SELECT count(*) FROM pg_stat_activity WHERE pid = $1 AND state = 'active'",
+            &[&pid],
+        )
+        .await
+        .expect("pg_stat_activity should be readable")
+        .get(0);
+    assert_eq!(active, 1, "the server runs the statement no one waits for");
+
+    drop(session);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let backends: i64 = admin
+            .conn
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE pid = $1",
+                &[&pid],
+            )
+            .await
+            .expect("pg_stat_activity should be readable")
+            .get(0);
+        if backends == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the dropped session's backend is still running"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let written: i64 = admin
+        .conn
+        .query_one("SELECT count(*) FROM dropped_session_writes", &[])
+        .await
+        .expect("the table should be readable")
+        .get(0);
+    assert_eq!(
+        written, 0,
+        "the dropped session's transaction is rolled back"
+    );
+}

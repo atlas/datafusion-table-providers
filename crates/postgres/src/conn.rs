@@ -385,7 +385,7 @@ fn format_postgres_query_error(source: &bb8_postgres::tokio_postgres::Error) -> 
 }
 
 /// How long a request to cancel a query may take before it is abandoned.
-const CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A request to cancel a query, sent when dropped unless disarmed first: the server stops
 /// working on a query no one waits for, rather than run it to completion, or its timeout.

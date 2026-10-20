@@ -1,14 +1,19 @@
 //! Connecting over TLS in each `sslmode`, to a server presenting a certificate an authority
-//! of the test's own issued for `localhost`. Runs against whichever TLS the build has.
+//! of the test's own issued for `localhost`, and for a session's pinned host. Runs against
+//! whichever TLS the build has.
 
 use super::common;
-use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
+use crate::docker::RunningContainer;
+use datafusion_table_providers::sql::db_connection_pool::postgrespool::{
+    self, PostgresConnectionPool,
+};
 use datafusion_table_providers::util::secrets::to_secret_map;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, IsCa, KeyPair, KeyUsagePurpose,
 };
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Duration;
 
 /// A certificate authority. Named apart from what it issues: OpenSSL takes a certificate
 /// whose subject is its issuer's to be self-signed.
@@ -42,13 +47,21 @@ async fn write_server_file(pool: &PostgresConnectionPool, path: &str, pem: &str)
         .unwrap();
 }
 
-/// Turns TLS on, presenting a certificate `authority` issued for `localhost`.
-async fn enable_tls(pool: &PostgresConnectionPool, authority: &CertifiedIssuer<'static, KeyPair>) {
+/// Turns TLS on, presenting a certificate `authority` issued for `names`.
+async fn enable_tls(
+    pool: &PostgresConnectionPool,
+    authority: &CertifiedIssuer<'static, KeyPair>,
+    names: &[&str],
+) {
     let key = KeyPair::generate().unwrap();
-    let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-    params
-        .distinguished_name
-        .push(DnType::CommonName, "localhost");
+    let mut params = CertificateParams::new(
+        names
+            .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    params.distinguished_name.push(DnType::CommonName, names[0]);
     let cert = params.signed_by(&key, authority).unwrap();
 
     let conn = pool.connect_direct().await.unwrap();
@@ -106,38 +119,61 @@ async fn connect(params: HashMap<String, String>) -> Result<bool, String> {
     Ok(row.get(0))
 }
 
+/// Whether a session connected, and if so whether over TLS.
+async fn connect_session(params: HashMap<String, String>) -> Result<bool, String> {
+    let session =
+        postgrespool::connect_session(to_secret_map(params), None, Duration::from_secs(30))
+            .await
+            .map_err(|e| e.to_string())?;
+    let row = session
+        .client
+        .query_one(
+            "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+            &[],
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(row.get(0))
+}
+
+/// A server presenting a certificate `authority` issued for `names`, once it offers TLS.
+async fn tls_server(
+    port: usize,
+    authority: &CertifiedIssuer<'static, KeyPair>,
+    names: &[&str],
+) -> RunningContainer {
+    let container = common::start_postgres_docker_container(port)
+        .await
+        .expect("Postgres container to start");
+    let admin = PostgresConnectionPool::new(to_secret_map(common::get_pg_params(port)))
+        .await
+        .expect("a plain connection");
+    enable_tls(&admin, authority, names).await;
+
+    // The reload is asynchronous: wait until the server offers TLS.
+    for _ in 0..50 {
+        if connect(params(port, "localhost", "require", None)).await == Ok(true) {
+            return container;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("the server should offer TLS once reloaded");
+}
+
 /// Host, `sslmode`, `sslrootcert`, and whether that connects and, if so, over TLS.
 type Case<'a> = (&'a str, &'a str, Option<&'a Path>, Result<bool, ()>);
 
 #[tokio::test]
 async fn sslmodes_mean_what_they_mean_to_libpq() {
     let port = crate::get_random_port();
-    let container = common::start_postgres_docker_container(port)
-        .await
-        .expect("Postgres container to start");
-
     let authority = authority();
-    let admin = PostgresConnectionPool::new(to_secret_map(common::get_pg_params(port)))
-        .await
-        .expect("a plain connection");
-    enable_tls(&admin, &authority).await;
+    let container = tls_server(port, &authority, &["localhost"]).await;
 
     let dir = tempfile::tempdir().unwrap();
     let ours = dir.path().join("ours.pem");
     let theirs = dir.path().join("theirs.pem");
     std::fs::write(&ours, authority.pem()).unwrap();
     std::fs::write(&theirs, self::authority().pem()).unwrap();
-
-    // The reload is asynchronous: wait until the server offers TLS.
-    let mut offered = false;
-    for _ in 0..50 {
-        if connect(params(port, "localhost", "require", None)).await == Ok(true) {
-            offered = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    assert!(offered, "the server should offer TLS once reloaded");
 
     let cases: [Case; 8] = [
         ("localhost", "disable", None, Ok(false)),
@@ -154,6 +190,44 @@ async fn sslmodes_mean_what_they_mean_to_libpq() {
     ];
     for (host, sslmode, root, expected) in cases {
         let outcome = connect(params(port, host, sslmode, root)).await;
+        assert_eq!(
+            outcome.as_ref().map(|ssl| *ssl).map_err(|_| ()),
+            expected,
+            "host={host} sslmode={sslmode} sslrootcert={}: {outcome:?}",
+            root.map_or("none".into(), |p| p.display().to_string()),
+        );
+    }
+
+    container
+        .remove()
+        .await
+        .expect("to stop postgres container");
+}
+
+/// A session reaches the server at its pinned `hostaddr` and verifies the server's
+/// certificate against `host`, never the address.
+#[tokio::test]
+async fn a_session_connects_to_its_pinned_address_and_verifies_its_host() {
+    let port = crate::get_random_port();
+    let authority = authority();
+    // `.invalid` resolves nowhere, so only the pinned address reaches the server.
+    let container = tls_server(port, &authority, &["localhost", "customer.invalid"]).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let ours = dir.path().join("ours.pem");
+    std::fs::write(&ours, authority.pem()).unwrap();
+
+    let cases: [Case; 3] = [
+        ("customer.invalid", "verify-full", Some(&ours), Ok(true)),
+        // The certificate is not issued for this name, wherever it is reached.
+        ("elsewhere.invalid", "verify-full", Some(&ours), Err(())),
+        // No root trusts our authority.
+        ("customer.invalid", "verify-full", None, Err(())),
+    ];
+    for (host, sslmode, root, expected) in cases {
+        let mut params = params(port, host, sslmode, root);
+        params.insert("pg_hostaddr".to_string(), "127.0.0.1".to_string());
+        let outcome = connect_session(params).await;
         assert_eq!(
             outcome.as_ref().map(|ssl| *ssl).map_err(|_| ()),
             expected,

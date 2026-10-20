@@ -4,10 +4,11 @@
     allow(clippy::clone_on_copy)
 )]
 
-use crate::conn::PostgresConnection;
+use crate::conn::{PostgresConnection, CANCEL_TIMEOUT};
 use crate::tls;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use std::{collections::HashMap, str::FromStr, sync::Arc};
 
 use async_trait::async_trait;
@@ -433,6 +434,99 @@ impl PostgresConnectionPool {
     }
 }
 
+/// One connection made with the parameters, TLS and pinned addresses a pool's would be, never
+/// pooled. Dropping it cancels a running statement and closes the socket, so the server rolls
+/// back an open transaction.
+pub struct Session {
+    pub client: tokio_postgres::Client,
+    pub cancel: tokio_postgres::CancelToken,
+    connection: tokio::task::JoinHandle<()>,
+    tls: tls::Connector,
+    runtime: Handle,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if self.connection.is_finished() {
+            return;
+        }
+        self.connection.abort();
+        // Closing the socket alone does not stop a statement the server is running.
+        let cancel = self.cancel.clone();
+        let tls = self.tls.clone();
+        self.runtime.spawn(async move {
+            match tokio::time::timeout(CANCEL_TIMEOUT, cancel.cancel_query(tls)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::debug!("could not cancel a postgres session's statement: {e}")
+                }
+                Err(_) => tracing::debug!("cancelling a postgres session's statement timed out"),
+            }
+        });
+    }
+}
+
+/// Opens a [`Session`] from `params` as a pool would, with TCP keepalives after
+/// `keepalives_idle`. The password comes from `password`, else from `params`. It runs no
+/// statement on the connection.
+///
+/// # Errors
+///
+/// Returns an error if the parameters are invalid, the password provider fails, or the
+/// connection cannot be made.
+pub async fn connect_session(
+    params: HashMap<String, SecretString>,
+    password: Option<Arc<dyn PasswordProvider>>,
+    keepalives_idle: Duration,
+) -> Result<Session> {
+    let params = util::remove_prefix_from_hashmap_keys(params, "pg_");
+
+    let mut config = session_config(&params, keepalives_idle)?;
+    let root_certs = root_certs(&params).await?;
+    let connector = tls::connector(ssl_mode(&params)?.as_str(), root_certs.as_deref())?;
+
+    let password = match password {
+        Some(provider) => Some(
+            provider
+                .get_password()
+                .await
+                .map_err(|source| Error::PasswordProviderError { source })?,
+        ),
+        None => static_password(&params),
+    };
+    if let Some(password) = &password {
+        config.password(password.expose_secret());
+    }
+
+    let (client, connection) = config
+        .connect(connector.clone())
+        .await
+        .map_err(classify_connection_error)?;
+    let connection = tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            tracing::debug!("postgres session connection error: {e}");
+        }
+    });
+
+    Ok(Session {
+        cancel: client.cancel_token(),
+        client,
+        connection,
+        tls: connector,
+        runtime: Handle::current(),
+    })
+}
+
+/// A pool's connection config, with TCP keepalives after `keepalives_idle`.
+fn session_config(
+    params: &HashMap<String, SecretString>,
+    keepalives_idle: Duration,
+) -> Result<Config> {
+    let (mut config, _) = config_from(params)?;
+    config.keepalives(true).keepalives_idle(keepalives_idle);
+    Ok(config)
+}
+
 /// Parses a connection string into components, extracting `sslmode`, `sslrootcert`,
 /// and `password` separately so they can be handled by the caller.
 fn parse_connection_string(
@@ -852,6 +946,14 @@ mod tests {
         assert!(!verify, "a pinned pool never resolves or probes the host");
         let unpinned = config_from(&params_without("hostaddr")).unwrap();
         assert!(unpinned.1);
+    }
+
+    #[test]
+    fn a_session_is_pinned_and_kept_alive() {
+        let config = session_config(&params(PINNED), Duration::from_secs(30)).unwrap();
+        assert!(config.get_keepalives());
+        assert_eq!(config.get_keepalives_idle(), Duration::from_secs(30));
+        assert_eq!(config.get_hostaddrs(), [IpAddr::from([127, 0, 0, 1])]);
     }
 
     #[test]
