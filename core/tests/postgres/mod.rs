@@ -19,15 +19,19 @@ use datafusion_federation::schema_cast::record_convert::try_cast_to;
 
 use datafusion_table_providers::{
     postgres::{DynPostgresConnectionPool, PostgresTableProviderFactory},
-    sql::db_connection_pool::postgrespool::PostgresConnectionPool,
+    sql::db_connection_pool::dbconnection::postgresconn::PostgresConnection,
+    sql::db_connection_pool::postgrespool::{connect_session, PostgresConnectionPool, Session},
+    sql::db_connection_pool::{PasswordProvider, StaticPasswordProvider},
     sql::sql_provider_datafusion::{get_stream, SqlTable},
     util::secrets::to_secret_map,
     UnsupportedTypeAction,
 };
 use rstest::{fixture, rstest};
+use secrecy::SecretString;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{Mutex, MutexGuard};
 
 mod common;
@@ -1855,6 +1859,81 @@ async fn test_postgres_query_typed_arrow(container_manager: &Mutex<ContainerMana
     );
 }
 
+/// The backend `session` is connected to.
+async fn session_pid(session: &Session) -> i32 {
+    session
+        .client
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("pg_backend_pid should be readable")
+        .get(0)
+}
+
+/// Starts a minute-long statement on `session` and stops waiting for it after a second,
+/// checking through `admin` that the server runs it still.
+async fn abandon_a_statement(session: &Session, admin: &PostgresConnection) {
+    let pid = session_pid(session).await;
+    let sleeping = tokio::time::timeout(
+        Duration::from_secs(1),
+        session.client.batch_execute("SELECT pg_sleep(60)"),
+    )
+    .await;
+    assert!(sleeping.is_err(), "the statement has not finished");
+
+    let active: i64 = admin
+        .conn
+        .query_one(
+            "SELECT count(*) FROM pg_stat_activity WHERE pid = $1 AND state = 'active'",
+            &[&pid],
+        )
+        .await
+        .expect("pg_stat_activity should be readable")
+        .get(0);
+    assert_eq!(active, 1, "the server runs the statement no one waits for");
+}
+
+/// Waits up to five seconds for the server to end the backend `pid`.
+async fn assert_backend_ends(admin: &PostgresConnection, pid: i32) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let backends: i64 = admin
+            .conn
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE pid = $1",
+                &[&pid],
+            )
+            .await
+            .expect("pg_stat_activity should be readable")
+            .get(0);
+        if backends == 0 {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the session's backend is still running"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A session pinned to the server's address under a host name that resolves nowhere, with
+/// its password from a provider.
+async fn pinned_session(port: usize) -> Session {
+    let mut params = common::get_pg_params(port);
+    params.insert("pg_host".to_string(), "customer.invalid".to_string());
+    params.insert("pg_hostaddr".to_string(), "127.0.0.1".to_string());
+    let password = params.remove("pg_pass").expect("pg_pass should be present");
+    let provider: Arc<dyn PasswordProvider> =
+        Arc::new(StaticPasswordProvider::new(SecretString::from(password)));
+    connect_session(
+        to_secret_map(params),
+        Some(provider),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("a pinned session should connect without resolving its host")
+}
+
 /// A session dropped while its statement runs cancels it, through the pinned address its
 /// connection used, and closes its socket: the server ends the backend and rolls back what
 /// its transaction wrote. Closing the socket alone would leave `pg_sleep` running.
@@ -1863,12 +1942,6 @@ async fn test_postgres_query_typed_arrow(container_manager: &Mutex<ContainerMana
 async fn test_postgres_a_dropped_session_is_cancelled_and_closed(
     container_manager: &Mutex<ContainerManager>,
 ) {
-    use datafusion_table_providers::sql::db_connection_pool::{
-        postgrespool::connect_session, PasswordProvider, StaticPasswordProvider,
-    };
-    use secrecy::SecretString;
-    use std::time::Duration;
-
     let mut container_manager = container_manager.lock().await;
     if !container_manager.claimed {
         container_manager.claimed = true;
@@ -1887,27 +1960,8 @@ async fn test_postgres_a_dropped_session_is_cancelled_and_closed(
         .await
         .expect("the table should be created");
 
-    let mut params = common::get_pg_params(container_manager.port);
-    // `.invalid` resolves nowhere, so only the pinned address reaches the server.
-    params.insert("pg_host".to_string(), "customer.invalid".to_string());
-    params.insert("pg_hostaddr".to_string(), "127.0.0.1".to_string());
-    let password = params.remove("pg_pass").expect("pg_pass should be present");
-    let provider: Arc<dyn PasswordProvider> =
-        Arc::new(StaticPasswordProvider::new(SecretString::from(password)));
-    let session = connect_session(
-        to_secret_map(params),
-        Some(provider),
-        Duration::from_secs(30),
-    )
-    .await
-    .expect("a pinned session should connect without resolving its host");
-
-    let pid: i32 = session
-        .client
-        .query_one("SELECT pg_backend_pid()", &[])
-        .await
-        .expect("pg_backend_pid should be readable")
-        .get(0);
+    let session = pinned_session(container_manager.port).await;
+    let pid = session_pid(&session).await;
     session
         .client
         .batch_execute("BEGIN")
@@ -1918,45 +1972,10 @@ async fn test_postgres_a_dropped_session_is_cancelled_and_closed(
         .execute("INSERT INTO dropped_session_writes VALUES (1)", &[])
         .await
         .expect("the row should be written");
-    let sleeping = tokio::time::timeout(
-        Duration::from_secs(1),
-        session.client.batch_execute("SELECT pg_sleep(60)"),
-    )
-    .await;
-    assert!(sleeping.is_err(), "the statement has not finished");
-
-    let active: i64 = admin
-        .conn
-        .query_one(
-            "SELECT count(*) FROM pg_stat_activity WHERE pid = $1 AND state = 'active'",
-            &[&pid],
-        )
-        .await
-        .expect("pg_stat_activity should be readable")
-        .get(0);
-    assert_eq!(active, 1, "the server runs the statement no one waits for");
+    abandon_a_statement(&session, &admin).await;
 
     drop(session);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let backends: i64 = admin
-            .conn
-            .query_one(
-                "SELECT count(*) FROM pg_stat_activity WHERE pid = $1",
-                &[&pid],
-            )
-            .await
-            .expect("pg_stat_activity should be readable")
-            .get(0);
-        if backends == 0 {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the dropped session's backend is still running"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    assert_backend_ends(&admin, pid).await;
 
     let written: i64 = admin
         .conn
@@ -1968,4 +1987,58 @@ async fn test_postgres_a_dropped_session_is_cancelled_and_closed(
         written, 0,
         "the dropped session's transaction is rolled back"
     );
+}
+
+/// A session closed after its commit keeps what it committed, and its backend ends.
+#[rstest]
+#[test_log::test(tokio::test)]
+async fn test_postgres_a_closed_session_keeps_its_commit(
+    container_manager: &Mutex<ContainerManager>,
+) {
+    let mut container_manager = container_manager.lock().await;
+    if !container_manager.claimed {
+        container_manager.claimed = true;
+        start_container(&mut container_manager).await;
+    }
+
+    let admin = common::get_postgres_connection_pool(container_manager.port)
+        .await
+        .expect("Postgres connection pool should be created")
+        .connect_direct()
+        .await
+        .expect("Connection should be established");
+    admin
+        .conn
+        .batch_execute("CREATE TABLE closed_session_writes (id int)")
+        .await
+        .expect("the table should be created");
+
+    let session = pinned_session(container_manager.port).await;
+    let pid = session_pid(&session).await;
+    session
+        .client
+        .batch_execute("BEGIN")
+        .await
+        .expect("a transaction should begin");
+    session
+        .client
+        .execute("INSERT INTO closed_session_writes VALUES (1)", &[])
+        .await
+        .expect("the row should be written");
+    session
+        .client
+        .batch_execute("COMMIT")
+        .await
+        .expect("the transaction should commit");
+
+    session.close();
+    assert_backend_ends(&admin, pid).await;
+
+    let written: i64 = admin
+        .conn
+        .query_one("SELECT count(*) FROM closed_session_writes", &[])
+        .await
+        .expect("the table should be readable")
+        .get(0);
+    assert_eq!(written, 1, "the closed session's commit is kept");
 }

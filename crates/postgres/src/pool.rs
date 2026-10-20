@@ -434,24 +434,49 @@ impl PostgresConnectionPool {
     }
 }
 
+/// How long a closed session's connection may take to end before its socket is dropped.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// One connection made with the parameters, TLS and pinned addresses a pool's would be, never
 /// pooled. Dropping it cancels a running statement and closes the socket, so the server rolls
-/// back an open transaction.
+/// back an open transaction; [`Session::close`] ends it without the cancel.
 pub struct Session {
     pub client: tokio_postgres::Client,
     pub cancel: tokio_postgres::CancelToken,
-    connection: tokio::task::JoinHandle<()>,
+    connection: Option<tokio::task::JoinHandle<()>>,
     tls: tls::Connector,
     runtime: Handle,
+    cancel_on_drop: bool,
+}
+
+impl Session {
+    /// Ends a session no statement is running on, once `COMMIT` or `ROLLBACK` has returned:
+    /// the connection ends with `Terminate`, and no cancel request is sent.
+    pub fn close(mut self) {
+        self.cancel_on_drop = false;
+    }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if self.connection.is_finished() {
+        let Some(mut connection) = self.connection.take() else {
+            return;
+        };
+        if !self.cancel_on_drop {
+            // The client, dropped after this, has the connection send `Terminate` and end.
+            self.runtime.spawn(async move {
+                if tokio::time::timeout(CLOSE_TIMEOUT, &mut connection)
+                    .await
+                    .is_err()
+                {
+                    connection.abort();
+                }
+            });
             return;
         }
-        self.connection.abort();
-        // Closing the socket alone does not stop a statement the server is running.
+        connection.abort();
+        // Sent even when the connection already ended: a socket that failed mid-statement
+        // leaves the statement running. Closing the socket alone does not stop it either.
         let cancel = self.cancel.clone();
         let tls = self.tls.clone();
         self.runtime.spawn(async move {
@@ -468,7 +493,8 @@ impl Drop for Session {
 
 /// Opens a [`Session`] from `params` as a pool would, with TCP keepalives after
 /// `keepalives_idle`. The password comes from `password`, else from `params`. It runs no
-/// statement on the connection.
+/// statement on the connection. It does not bound how long connecting takes, so callers
+/// wrap it in a timeout.
 ///
 /// # Errors
 ///
@@ -511,9 +537,10 @@ pub async fn connect_session(
     Ok(Session {
         cancel: client.cancel_token(),
         client,
-        connection,
+        connection: Some(connection),
         tls: connector,
         runtime: Handle::current(),
+        cancel_on_drop: true,
     })
 }
 

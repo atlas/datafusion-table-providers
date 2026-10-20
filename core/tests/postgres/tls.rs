@@ -2,7 +2,7 @@
 //! of the test's own issued for `localhost`, and for a session's pinned host. Runs against
 //! whichever TLS the build has.
 
-use super::common;
+use super::{abandon_a_statement, assert_backend_ends, common, session_pid};
 use crate::docker::RunningContainer;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::{
     self, PostgresConnectionPool,
@@ -99,6 +99,18 @@ fn params(
     if let Some(path) = sslrootcert {
         params.insert("pg_sslrootcert".to_string(), path.display().to_string());
     }
+    params
+}
+
+/// [`params`], with the host pinned to the server's address.
+fn pinned_params(
+    port: usize,
+    host: &str,
+    sslmode: &str,
+    sslrootcert: Option<&Path>,
+) -> HashMap<String, String> {
+    let mut params = params(port, host, sslmode, sslrootcert);
+    params.insert("pg_hostaddr".to_string(), "127.0.0.1".to_string());
     params
 }
 
@@ -205,7 +217,8 @@ async fn sslmodes_mean_what_they_mean_to_libpq() {
 }
 
 /// A session reaches the server at its pinned `hostaddr` and verifies the server's
-/// certificate against `host`, never the address.
+/// certificate against `host`, never the address. Dropped mid-statement, its cancel request
+/// takes the same path and stops the statement.
 #[tokio::test]
 async fn a_session_connects_to_its_pinned_address_and_verifies_its_host() {
     let port = crate::get_random_port();
@@ -225,9 +238,7 @@ async fn a_session_connects_to_its_pinned_address_and_verifies_its_host() {
         ("customer.invalid", "verify-full", None, Err(())),
     ];
     for (host, sslmode, root, expected) in cases {
-        let mut params = params(port, host, sslmode, root);
-        params.insert("pg_hostaddr".to_string(), "127.0.0.1".to_string());
-        let outcome = connect_session(params).await;
+        let outcome = connect_session(pinned_params(port, host, sslmode, root)).await;
         assert_eq!(
             outcome.as_ref().map(|ssl| *ssl).map_err(|_| ()),
             expected,
@@ -235,6 +246,29 @@ async fn a_session_connects_to_its_pinned_address_and_verifies_its_host() {
             root.map_or("none".into(), |p| p.display().to_string()),
         );
     }
+
+    let admin = PostgresConnectionPool::new(to_secret_map(common::get_pg_params(port)))
+        .await
+        .expect("a plain connection")
+        .connect_direct()
+        .await
+        .expect("Connection should be established");
+    let session = postgrespool::connect_session(
+        to_secret_map(pinned_params(
+            port,
+            "customer.invalid",
+            "verify-full",
+            Some(ours.as_path()),
+        )),
+        None,
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("a pinned session should connect over TLS");
+    let pid = session_pid(&session).await;
+    abandon_a_statement(&session, &admin).await;
+    drop(session);
+    assert_backend_ends(&admin, pid).await;
 
     container
         .remove()
