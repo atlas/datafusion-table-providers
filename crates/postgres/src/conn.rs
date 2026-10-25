@@ -455,7 +455,9 @@ impl Stream for HoldingConnection {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let polled = self.batches.poll_next_unpin(cx);
         if let Poll::Ready(None) = polled {
-            self.conn = None;
+            if let Some(conn) = self.conn.take() {
+                crate::pool::end_transaction(conn.conn);
+            }
         }
         polled
     }

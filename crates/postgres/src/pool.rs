@@ -4,7 +4,7 @@
     allow(clippy::clone_on_copy)
 )]
 
-use crate::conn::PostgresConnection;
+use crate::conn::{PostgresConnection, PostgresPooledConnection};
 use crate::tls;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -103,6 +103,11 @@ pub enum Error {
 
     #[snafu(display("Task failed to execute on IO runtime.\n{source}"))]
     IoRuntimeError { source: tokio::task::JoinError },
+
+    #[snafu(display(
+        "The server exported a snapshot named {id:?}, which is not a snapshot identifier."
+    ))]
+    UnexpectedSnapshotError { id: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -177,6 +182,9 @@ impl ConnectionManager {
 pub struct PostgresClient {
     client: tokio_postgres::Client,
     pub(crate) cancelled: Arc<AtomicBool>,
+    /// Whether a transaction may be open on it, which the pool rolls back before handing
+    /// it out again.
+    pub(crate) in_transaction: AtomicBool,
 }
 
 impl Deref for PostgresClient {
@@ -257,6 +265,7 @@ impl bb8::ManageConnection for ConnectionManager {
         Ok(PostgresClient {
             client,
             cancelled: Arc::default(),
+            in_transaction: AtomicBool::new(false),
         })
     }
 
@@ -264,6 +273,11 @@ impl bb8::ManageConnection for ConnectionManager {
         &self,
         conn: &mut PostgresClient,
     ) -> std::result::Result<(), ConnectionManagerError> {
+        if conn.in_transaction.load(Ordering::Relaxed) {
+            conn.batch_execute("ROLLBACK").await?;
+            conn.in_transaction.store(false, Ordering::Relaxed);
+            return Ok(());
+        }
         conn.simple_query("").await.map(|_| ())?;
         Ok(())
     }
@@ -430,6 +444,176 @@ impl PostgresConnectionPool {
             pool.get_owned().await.map_err(map_pool_run_error)?
         };
         Ok(PostgresConnection::new(conn).with_cancel_tls(self.tls.clone()))
+    }
+}
+
+impl PostgresConnectionPool {
+    /// A connection from the pool, as [`DbConnectionPool::connect`] hands it out.
+    async fn connection(
+        &self,
+    ) -> std::result::Result<PostgresConnection, Box<dyn std::error::Error + Send + Sync>> {
+        let pool = Arc::clone(&self.pool);
+        let conn = if let Some(handle) = &self.io_handle {
+            handle
+                .spawn(async move { pool.get_owned().await.map_err(map_pool_run_error) })
+                .await
+                .context(IoRuntimeSnafu)??
+        } else {
+            let get_conn = async || pool.get_owned().await.map_err(map_pool_run_error);
+            run_async_with_tokio(get_conn).await?
+        };
+        Ok(PostgresConnection::new(conn)
+            .with_unsupported_type_action(self.unsupported_type_action)
+            .with_cancel_tls(self.tls.clone()))
+    }
+
+    /// Begins a read-only, repeatable-read transaction on one of the pool's connections
+    /// and exports its snapshot, which the transactions of a [`SnapshotPool`]'s
+    /// connections then read; see [`PostgresConnectionPool::reading`].
+    ///
+    /// The transaction stays open, holding the connection, until the snapshot is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no connection is to be had or the server refuses to begin the
+    /// transaction or export its snapshot.
+    pub async fn export_snapshot(&self) -> Result<ExportedSnapshot> {
+        let conn = self.connect_direct().await?.conn;
+        // Before `BEGIN`, so a connection whose transaction began but failed after is
+        // rolled back all the same.
+        conn.in_transaction.store(true, Ordering::Relaxed);
+        conn.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .await
+            .context(ConnectionPoolSnafu)?;
+        let id: String = conn
+            .query_one("SELECT pg_export_snapshot()", &[])
+            .await
+            .context(ConnectionPoolSnafu)?
+            .get(0);
+        // It is written into the statement that takes it up.
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+            return UnexpectedSnapshotSnafu { id }.fail();
+        }
+        Ok(ExportedSnapshot {
+            id,
+            conn: Some(conn),
+        })
+    }
+
+    /// The pool's connections, each handed out in a read-only transaction that reads
+    /// `snapshot`: every query on them sees the database as `snapshot`'s own transaction
+    /// does, whatever is committed meanwhile.
+    pub fn reading(self: &Arc<Self>, snapshot: Arc<ExportedSnapshot>) -> SnapshotPool {
+        SnapshotPool {
+            pool: Arc::clone(self),
+            snapshot,
+        }
+    }
+}
+
+/// A snapshot exported from a read-only transaction kept open on one of a pool's
+/// connections; see [`PostgresConnectionPool::export_snapshot`]. Dropping it ends that
+/// transaction, after which the snapshot can no longer be taken up; transactions that took
+/// it up keep reading it.
+pub struct ExportedSnapshot {
+    id: String,
+    conn: Option<PostgresPooledConnection>,
+}
+
+impl ExportedSnapshot {
+    /// The snapshot's identifier, as `pg_export_snapshot` returned it.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl std::fmt::Debug for ExportedSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExportedSnapshot")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for ExportedSnapshot {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            end_transaction(conn);
+        }
+    }
+}
+
+/// Returns `conn` to its pool, rolling back the transaction that may be open on it first.
+///
+/// The pool would roll it back before handing the connection out again anyway, but until
+/// then the transaction would keep the rows its snapshot sees from being vacuumed. Without
+/// a runtime to roll back on, it is left to the pool.
+pub(crate) fn end_transaction(conn: PostgresPooledConnection) {
+    // A connection whose query was cancelled is discarded, not handed out again.
+    if !conn.in_transaction.load(Ordering::Relaxed) || conn.cancelled.load(Ordering::Relaxed) {
+        return;
+    }
+    let Ok(runtime) = Handle::try_current() else {
+        return;
+    };
+    runtime.spawn(async move {
+        match conn.batch_execute("ROLLBACK").await {
+            Ok(()) => conn.in_transaction.store(false, Ordering::Relaxed),
+            // Left marked, so the pool tries again before handing it out, and discards it
+            // if that fails too.
+            Err(e) => tracing::debug!("could not roll back a postgres transaction: {e}"),
+        }
+    });
+}
+
+/// A pool's connections, each handed out in a read-only, repeatable-read transaction that
+/// reads one exported snapshot; see [`PostgresConnectionPool::reading`]. Each connection's
+/// transaction is rolled back once its query's results end, or else before the pool hands
+/// it out again.
+pub struct SnapshotPool {
+    pool: Arc<PostgresConnectionPool>,
+    snapshot: Arc<ExportedSnapshot>,
+}
+
+impl std::fmt::Debug for SnapshotPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SnapshotPool")
+            .field("snapshot", &self.snapshot)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl
+    DbConnectionPool<bb8::PooledConnection<'static, ConnectionManager>, &'static (dyn ToSql + Sync)>
+    for SnapshotPool
+{
+    async fn connect(
+        &self,
+    ) -> std::result::Result<
+        Box<
+            dyn DbConnection<
+                bb8::PooledConnection<'static, ConnectionManager>,
+                &'static (dyn ToSql + Sync),
+            >,
+        >,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let conn = self.pool.connection().await?;
+        conn.conn.in_transaction.store(true, Ordering::Relaxed);
+        conn.conn
+            .batch_execute(&format!(
+                "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT '{}'",
+                self.snapshot.id
+            ))
+            .await
+            .context(ConnectionPoolSnafu)?;
+        Ok(Box::new(conn))
+    }
+
+    fn join_push_down(&self) -> JoinPushDown {
+        self.pool.join_push_down.clone()
     }
 }
 
@@ -715,21 +899,7 @@ impl
         >,
         Box<dyn std::error::Error + Send + Sync>,
     > {
-        let pool = Arc::clone(&self.pool);
-        let conn = if let Some(handle) = &self.io_handle {
-            handle
-                .spawn(async move { pool.get_owned().await.map_err(map_pool_run_error) })
-                .await
-                .context(IoRuntimeSnafu)??
-        } else {
-            let get_conn = async || pool.get_owned().await.map_err(map_pool_run_error);
-            run_async_with_tokio(get_conn).await?
-        };
-        Ok(Box::new(
-            PostgresConnection::new(conn)
-                .with_unsupported_type_action(self.unsupported_type_action)
-                .with_cancel_tls(self.tls.clone()),
-        ))
+        Ok(Box::new(self.connection().await?))
     }
 
     fn join_push_down(&self) -> JoinPushDown {
