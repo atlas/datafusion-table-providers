@@ -20,7 +20,7 @@ members = ["core", "crates/common", "python", "crates/odbc", "crates/clickhouse"
 resolver = "2"
 
 [workspace.package]
-version = "0.14.0"
+version = "0.14.0-atlas.1"
 readme = "README.md"
 edition = "2021"
 repository = "https://github.com/datafusion-contrib/datafusion-table-providers"
@@ -40,23 +40,23 @@ arrow-json = "59.2"
 arrow-odbc = { version = "25.3" }
 datafusion = { version = "55.1", default-features = false }
 datafusion-expr = { version = "55.1" }
-datafusion-federation = { version = "0.5.7" }
+datafusion-federation = { git = "https://github.com/atlas/datafusion-federation", rev = "b7ddbc3ad8c0e51fab0bf08dc2550753f686d406", version = "=0.5.7-atlas.1", registry = "atlas" }
 datafusion-ffi = { version = "55.1" }
 datafusion-proto = { version = "55.1" }
 datafusion-physical-expr = { version = "55.1" }
 datafusion-physical-plan = { version = "55.1" }
-datafusion-table-providers = { version = "0.14.0", path = "core" }
-datafusion-table-providers-common = { version = "0.14.0", path = "crates/common" }
-datafusion-table-providers-odbc = { version = "0.14.0", path = "crates/odbc" }
-datafusion-table-providers-clickhouse = { version = "0.14.0", path = "crates/clickhouse" }
-datafusion-table-providers-flightsql = { version = "0.14.0", path = "crates/flightsql" }
-datafusion-table-providers-mongodb = { version = "0.14.0", path = "crates/mongodb" }
-datafusion-table-providers-mysql = { version = "0.14.0", path = "crates/mysql" }
-datafusion-table-providers-sqlite = { version = "0.14.0", path = "crates/sqlite" }
-datafusion-table-providers-postgres = { version = "0.14.0", path = "crates/postgres", default-features = false }
-datafusion-table-providers-duckdb = { version = "0.14.0", path = "crates/duckdb" }
-datafusion-table-providers-adbc = { version = "0.14.0", path = "crates/adbc" }
-datafusion-table-providers-oracle = { version = "0.14.0", path = "crates/oracle" }
+datafusion-table-providers = { version = "0.14.0-atlas.1", path = "core", registry = "atlas" }
+datafusion-table-providers-common = { version = "0.14.0-atlas.1", path = "crates/common", registry = "atlas" }
+datafusion-table-providers-odbc = { version = "0.14.0-atlas.1", path = "crates/odbc", registry = "atlas" }
+datafusion-table-providers-clickhouse = { version = "0.14.0-atlas.1", path = "crates/clickhouse", registry = "atlas" }
+datafusion-table-providers-flightsql = { version = "0.14.0-atlas.1", path = "crates/flightsql", registry = "atlas" }
+datafusion-table-providers-mongodb = { version = "0.14.0-atlas.1", path = "crates/mongodb", registry = "atlas" }
+datafusion-table-providers-mysql = { version = "0.14.0-atlas.1", path = "crates/mysql", registry = "atlas" }
+datafusion-table-providers-sqlite = { version = "0.14.0-atlas.1", path = "crates/sqlite", registry = "atlas" }
+datafusion-table-providers-postgres = { version = "0.14.0-atlas.1", path = "crates/postgres", registry = "atlas", default-features = false }
+datafusion-table-providers-duckdb = { version = "0.14.0-atlas.1", path = "crates/duckdb", registry = "atlas" }
+datafusion-table-providers-adbc = { version = "0.14.0-atlas.1", path = "crates/adbc", registry = "atlas" }
+datafusion-table-providers-oracle = { version = "0.14.0-atlas.1", path = "crates/oracle", registry = "atlas" }
 duckdb = { version = "1.10505.0" }
 adbc_core = { version = "0.24" }
 adbc_driver_manager = { version = "0.24" }
